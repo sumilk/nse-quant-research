@@ -1,0 +1,12 @@
+.git
+.venv
+.claude
+.agents
+data
+results
+**/__pycache__
+**/*.py[oc]
+.pytest_cache
+*.egg-info
+Dockerfile
+compose.yaml

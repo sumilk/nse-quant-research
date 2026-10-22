@@ -1,0 +1,31 @@
+# Dashboard:   docker compose up -d dashboard          -> http://localhost:8501
+# Pipeline:    docker compose run --rm pipeline india_etf_momentum.data
+#              docker compose run --rm pipeline india_etf_momentum.research
+#              docker compose run --rm pipeline india_etf_momentum.current
+# Holdout (once): docker compose run --rm pipeline india_etf_momentum.holdout --i-have-not-changed-anything
+
+x-app: &app
+  build:
+    context: .
+    target: runtime
+  image: india-etf-momentum:latest
+  volumes:
+    - ./data:/app/data
+    - ./results:/app/results
+    # Config and pre-registration mounted read-only so edits on the host apply
+    # without a rebuild, and nothing inside the container can rewrite them.
+    - ./config:/app/config:ro
+    - ./HYPOTHESIS.md:/app/HYPOTHESIS.md:ro
+
+services:
+  dashboard:
+    <<: *app
+    ports:
+      - "8501:8501"
+    restart: unless-stopped
+
+  pipeline:
+    <<: *app
+    entrypoint: ["python", "-m"]
+    command: ["india_etf_momentum.research"]
+    profiles: ["jobs"]
