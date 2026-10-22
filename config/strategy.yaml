@@ -1,0 +1,87 @@
+# Single source of truth for the strategy. Pre-registered in HYPOTHESIS.md.
+strategy_id: india_etf_momentum
+setup_version: v1
+
+periods:
+  data_start: "2005-01-01"
+  dev_end: "2024-09-30"
+  holdout_start: "2024-10-01"
+
+# source: nse = NSE price index (+ NSE dividend yield where published);
+#         nse_tr = NSE index that is already total return (bond, overnight rate);
+#         yahoo = ETF price itself (no index history available).
+# tax_class: equity | gold_silver | debt  (see tax section)
+universe:
+  calendar_master: NIFTY 50
+  min_history_sessions: 252
+  assets:
+    - {id: NIFTY50,    source: nse,    index: "NIFTY 50",               etf: NIFTYBEES,  tax_class: equity}
+    - {id: NEXT50,     source: nse,    index: "NIFTY NEXT 50",          etf: JUNIORBEES, tax_class: equity}
+    - {id: MIDCAP150,  source: nse,    index: "NIFTY MIDCAP 150",       etf: MID150BEES, tax_class: equity}
+    - {id: SMALLCAP250, source: nse,   index: "NIFTY SMALLCAP 250",     etf: HDFCSML250, tax_class: equity}
+    - {id: BANK,       source: nse,    index: "NIFTY BANK",             etf: BANKBEES,   tax_class: equity}
+    - {id: IT,         source: nse,    index: "NIFTY IT",               etf: ITBEES,     tax_class: equity}
+    - {id: PHARMA,     source: nse,    index: "NIFTY PHARMA",           etf: PHARMABEES, tax_class: equity}
+    - {id: FMCG,       source: nse,    index: "NIFTY FMCG",             etf: FMCGIETF,   tax_class: equity}
+    - {id: AUTO,       source: nse,    index: "NIFTY AUTO",             etf: AUTOBEES,   tax_class: equity}
+    - {id: METAL,      source: nse,    index: "NIFTY METAL",            etf: METALIETF,  tax_class: equity}
+    - {id: OILGAS,     source: nse,    index: "NIFTY OIL & GAS",        etf: OILIETF,    tax_class: equity}
+    - {id: REALTY,     source: nse,    index: "NIFTY REALTY",           etf: MOREALTY,   tax_class: equity}
+    - {id: PSUBANK,    source: nse,    index: "NIFTY PSU BANK",         etf: PSUBNKBEES, tax_class: equity}
+    - {id: CPSE,       source: nse,    index: "NIFTY CPSE",             etf: CPSEETF,    tax_class: equity}
+    - {id: GOLD,       source: yahoo,  index: null,                     etf: GOLDBEES,   tax_class: gold_silver}
+    - {id: SILVER,     source: yahoo,  index: null,                     etf: SILVERBEES, tax_class: gold_silver}
+    - {id: GSEC10Y,    source: nse_tr, index: "NIFTY 10 YR BENCHMARK G-SEC", etf: LTGILTBEES, tax_class: debt}
+    - {id: CASH,       source: nse_tr, index: "NIFTY 1D RATE INDEX",    etf: LIQUIDBEES, tax_class: debt}
+
+benchmarks:
+  nifty50: NIFTY50
+  momentum30: {source: nse, index: "NIFTY200 MOMENTUM 30"}
+
+decision:
+  cadence: monthly_last_session      # decide on the close of the last NSE session of the month
+  execution_lag_sessions: 1          # trade at the close of the next session
+
+primary:
+  score: ret
+  lookback: 126
+  skip: 0
+  top_k: 4
+
+grid:
+  score: [ret, sharpe]
+  lookback_skip: [[63, 0], [126, 0], [252, 0], [252, 21]]
+  top_k: [3, 4, 5]
+
+portfolio:
+  initial_capital_inr: 1000000
+
+# Indian retail delivery charges (discount broker). Verify against your broker's
+# current schedule before deploying; these are the 2026 rates as understood.
+costs:
+  brokerage_inr_per_order: 0.0
+  stt_sell_pct: 0.001                # % of sell value, equity-oriented ETFs only
+  exchange_txn_pct: 0.00297          # NSE transaction charge, both sides
+  sebi_fee_pct: 0.0001               # Rs 10 per crore, both sides
+  stamp_duty_buy_pct: 0.015          # delivery, buy side
+  gst_pct: 18.0                      # on brokerage + exchange + SEBI fees
+  dp_charge_inr_per_sell: 16.0       # per scrip per sell day, incl. GST
+  # Half-spread tiers by ETF median daily traded value (Rs crore), in bps
+  half_spread_tiers: [[100, 2], [20, 5], [5, 10], [0, 20]]
+  impact_coefficient: 0.1            # square-root impact: k * daily_vol * sqrt(trade / ADV)
+  max_participation: 0.05            # capacity limit: trade <= 5% of ETF ADV
+
+tax:
+  apply_current_rules_to_all_history: true
+  cess_pct: 4.0
+  slab_rate_pct: 30.0
+  equity: {st_rate: 20.0, lt_rate: 12.5, lt_months: 12, lt_exemption_inr: 125000}
+  gold_silver: {st_rate: slab, lt_rate: 12.5, lt_months: 12, lt_exemption_inr: 0}
+  debt: {st_rate: slab, lt_rate: slab, lt_months: null, lt_exemption_inr: 0}
+
+evaluation:
+  pbo_blocks: 16
+  bootstrap_draws: 5000
+  newey_west_lags: 3
+  cost_multipliers: [0, 1, 2, 3]
+  walk_forward_selection: {min_train_years: 5, refit: annual, metric: active_sharpe}
