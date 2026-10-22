@@ -30,11 +30,18 @@ st.set_page_config(page_title="India Strategy Lab", page_icon="📈", layout="wi
 
 # ----- loading ------------------------------------------------------------------------------
 
-@st.cache_data
 def load(strategy_id: str, stage: str) -> dict | None:
+    """Artifacts for one strategy and stage; re-read whenever any artifact file changes."""
     d = results_dir(strategy_id) / "artifacts" / stage
     if not (d / "stats.json").exists():
         return None
+    stamp = max(f.stat().st_mtime for f in d.iterdir())
+    return _load(str(d), stamp)
+
+
+@st.cache_data
+def _load(path: str, stamp: float) -> dict:
+    d = Path(path)
     out = {"stats": json.loads((d / "stats.json").read_text())}
     for f in d.glob("*.parquet"):
         out[f.stem] = pd.read_parquet(f)
