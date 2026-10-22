@@ -1,21 +1,20 @@
-# Dashboard:   docker compose up -d dashboard          -> http://localhost:8501
-# Pipeline:    docker compose run --rm pipeline india_etf_momentum.data
-#              docker compose run --rm pipeline india_etf_momentum.research
-#              docker compose run --rm pipeline india_etf_momentum.current
-# Holdout (once): docker compose run --rm pipeline india_etf_momentum.holdout --i-have-not-changed-anything
+# Dashboard:   docker compose up -d dashboard               -> http://localhost:8501
+# Pipeline:    docker compose run --rm lab fetch
+#              docker compose run --rm lab research --strategy india_etf_momentum
+#              docker compose run --rm lab current  --strategy india_etf_momentum
+# Holdout (once per strategy):
+#              docker compose run --rm lab holdout --strategy india_etf_momentum --i-have-not-changed-anything
 
 x-app: &app
   build:
     context: .
     target: runtime
-  image: india-etf-momentum:latest
+  image: india-strategy-lab:latest
   volumes:
     - ./data:/app/data
-    - ./results:/app/results
-    # Config and pre-registration mounted read-only so edits on the host apply
-    # without a rebuild, and nothing inside the container can rewrite them.
-    - ./config:/app/config:ro
-    - ./HYPOTHESIS.md:/app/HYPOTHESIS.md:ro
+    # Whole strategies/ tree: configs and pre-registrations on the host apply
+    # without a rebuild, and results are written back to the host.
+    - ./strategies:/app/strategies
 
 services:
   dashboard:
@@ -24,8 +23,8 @@ services:
       - "8501:8501"
     restart: unless-stopped
 
-  pipeline:
+  lab:
     <<: *app
-    entrypoint: ["python", "-m"]
-    command: ["india_etf_momentum.research"]
+    entrypoint: ["lab"]
+    command: ["list"]
     profiles: ["jobs"]

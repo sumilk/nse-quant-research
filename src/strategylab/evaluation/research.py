@@ -1,12 +1,12 @@
 """Development-period research: data gate, signal gate, 24-trial grid, selection
 statistics, cost sensitivity, capacity, and the pre-registered gate table.
 
+Works for any strategy whose config names a registered model (see models/).
 Never touches sessions after periods.dev_end. The holdout lives in holdout.py.
 """
 
 from __future__ import annotations
 
-import itertools
 import json
 
 import matplotlib
@@ -16,37 +16,41 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from . import stats as st
-from .backtest import Result, run
-from .config import ROOT, load_config
-from .costs import CostModel
-from .panel import build_panel, save_panel
-from .signals import Spec, decision_schedule, eligibility, scores
-from .validate import validate
+from strategylab.evaluation import stats as st
+from strategylab.engine.backtest import Result, buy_hold, equal_weight, model_weights, run
+from strategylab.config import load_config, results_dir
+from strategylab.engine.costs import CostModel
+from strategylab.models import load_model
+from strategylab.data.panel import build_panel
+from strategylab.engine.schedule import decision_schedule, eligibility
+from strategylab.data.validate import validate
 
-OUT = ROOT / "results"
-FIG = OUT / "figures"
-MIN_RANKED_ASSETS = 8
-
-
-def grid_specs(cfg) -> list[Spec]:
-    g = cfg["grid"]
-    return [Spec(s, lb, sk, k) for s, (lb, sk), k in itertools.product(g["score"], g["lookback_skip"], g["top_k"])]
+MIN_SCORED_ASSETS = 8
 
 
-def primary_spec(cfg) -> Spec:
-    p = cfg["primary"]
-    return Spec(p["score"], p["lookback"], p["skip"], p["top_k"])
+def signal_specs(model, specs) -> dict:
+    """One representative spec per distinct signal (IC does not depend on portfolio parameters)."""
+    reps = {}
+    for s in specs:
+        reps.setdefault(model.signal_key(s), s)
+    return reps
 
 
-def common_start(levels, returns, cfg, specs, sched) -> pd.Timestamp:
+def common_start(model, levels, returns, cfg, specs, sched) -> pd.Timestamp:
+    """First decision date on which every trial's signal scores >= MIN_SCORED_ASSETS eligible assets."""
     elig = eligibility(levels, returns, cfg["universe"]["min_history_sessions"])
     ok = pd.Series(True, index=sched["decision"])
-    for spec in {(s.score, s.lookback, s.skip) for s in specs}:
-        sc = scores(levels, returns, Spec(*spec, 1))
+    for spec in signal_specs(model, specs).values():
+        sc = model.signal(levels, returns, spec)
         n = (sc.notna() & elig).sum(axis=1).reindex(sched["decision"])
-        ok &= (n >= MIN_RANKED_ASSETS).to_numpy()
+        ok &= (n >= MIN_SCORED_ASSETS).to_numpy()
     return ok[ok].index[0]
+
+
+def benchmarks(cfg) -> tuple[str, str]:
+    """(display name, asset id) of the buy-and-hold market benchmark."""
+    name, asset = next((k, v) for k, v in cfg.get("benchmarks", {}).items() if isinstance(v, str))
+    return name, asset
 
 
 def make_cost_model(cfg, panel, multiplier=1.0) -> CostModel:
@@ -61,10 +65,15 @@ def annual_cost_drag(res: Result) -> float:
 
 
 def capacity_inr(res: Result, panel, cfg) -> float:
+    """Capital at which the 95th-percentile trade reaches max_participation of its ETF's ADV.
+
+    Trades are scaled by the NAV on their date, so the answer does not depend on
+    how much the backtest's capital happened to grow.
+    """
     t = res.trades[res.trades["side"] != "sell_tax"].copy()
-    t["part"] = t["value"] / t["asset"].map(lambda a: panel.etf_adv_cr[a] * 1e7)
-    p95 = t["part"].quantile(0.95)
-    return float(cfg["portfolio"]["initial_capital_inr"] * cfg["costs"]["max_participation"] / p95)
+    nav_then = res.nav.reindex(pd.to_datetime(t["date"])).to_numpy()
+    t["part_per_inr"] = t["value"] / nav_then / t["asset"].map(lambda a: panel.etf_adv_cr[a] * 1e7)
+    return float(cfg["costs"]["max_participation"] / t["part_per_inr"].quantile(0.95))
 
 
 def pct(x, d=1):
@@ -75,28 +84,29 @@ def num(x, d=2):
     return "n/a" if x is None or (isinstance(x, float) and np.isnan(x)) else f"{x:.{d}f}"
 
 
-def main() -> None:
-    cfg = load_config()
-    OUT.mkdir(exist_ok=True)
-    FIG.mkdir(exist_ok=True)
-    panel = build_panel()
-    save_panel(panel)
+def main(strategy_id: str) -> None:
+    cfg = load_config(strategy_id)
+    model = load_model(cfg["model"])
+    OUT = results_dir(strategy_id)
+    FIG = OUT / "figures"
+    FIG.mkdir(parents=True, exist_ok=True)
+    panel = build_panel(cfg)
 
     # ---- Gate 1: data -----------------------------------------------------------------
-    data_ok, _ = validate(panel)
-    print(f"[data gate] {'PASS' if data_ok else 'FAIL'}  -> results/data_validation.md")
+    data_ok, _ = validate(panel, cfg, OUT)
+    print(f"[data gate] {'PASS' if data_ok else 'FAIL'}  -> {OUT / 'data_validation.md'}")
 
     dev_end = pd.Timestamp(cfg["periods"]["dev_end"])
     lv = panel.levels.loc[:dev_end]
     rt = panel.returns.loc[:dev_end]
     rf = panel.rf.loc[:dev_end]
-    specs = grid_specs(cfg)
-    prim = primary_spec(cfg)
+    specs = model.grid(cfg)
+    prim = model.primary(cfg)
     assert prim in specs, "primary spec must be one of the grid cells"
-    sched = decision_schedule(lv.index, cfg["decision"]["execution_lag_sessions"])
-    start = common_start(lv, rt, cfg, specs, sched)
+    sched = decision_schedule(lv.index, cfg["decision"]["execution_lag_sessions"], cfg["decision"]["cadence"])
+    start = common_start(model, lv, rt, cfg, specs, sched)
     sched = sched[sched["decision"] >= start]
-    print(f"[dev] {start.date()} .. {dev_end.date()}  ({len(sched)} monthly decisions)")
+    print(f"[{strategy_id}] {start.date()} .. {dev_end.date()}  ({len(sched)} decisions)")
 
     # ---- Gate 2: signal (cross-sectional rank IC) ---------------------------------------
     elig = eligibility(lv, rt, cfg["universe"]["min_history_sessions"])
@@ -112,24 +122,23 @@ def main() -> None:
 
     fwd1 = fwd_returns(1)
     ic_rows, ic_prim = [], None
-    for key in sorted({(s.score, s.lookback, s.skip) for s in specs}):
-        spec = Spec(*key, 1)
-        sc = scores(lv, rt, spec)
+    for key, spec in sorted(signal_specs(model, specs).items()):
+        sc = model.signal(lv, rt, spec)
         ic = st.ic_series(sc, fwd1, elig, fwd1.index[:-1])
         half = len(ic) // 2
         decay = {}
         for h in (1, 3, 6, 12):
             ich = st.ic_series(sc, fwd_returns(h), elig, fwd1.index[:-h])
             decay[f"IC_{h}m"] = ich.mean()
-        row = {"signal": f"{spec.score}_{spec.lookback}" + (f"-{spec.skip}" if spec.skip else ""),
+        row = {"signal": key,
                "mean_IC": ic.mean(), "IC_IR": ic.mean() / ic.std(), "t_NW": st.newey_west_t(ic, lag),
                "IC_1st_half": ic.iloc[:half].mean(), "IC_2nd_half": ic.iloc[half:].mean(),
                "hit_rate": (ic > 0).mean(), "n": len(ic), **decay}
         ic_rows.append(row)
-        if key == (prim.score, prim.lookback, prim.skip):
+        if key == model.signal_key(prim):
             ic_prim = ic
     ic_table = pd.DataFrame(ic_rows)
-    prow = ic_table[ic_table["signal"] == f"{prim.score}_{prim.lookback}" + (f"-{prim.skip}" if prim.skip else "")].iloc[0]
+    prow = ic_table[ic_table["signal"] == model.signal_key(prim)].iloc[0]
     signal_ok = bool(prow["t_NW"] > 2.0 and prow["IC_1st_half"] * prow["IC_2nd_half"] > 0 and prow["mean_IC"] > 0)
     suspicious_ic = bool(prow["mean_IC"] > 0.15)
     print(f"[signal gate] {'PASS' if signal_ok else 'FAIL'}  IC={prow['mean_IC']:.3f} t_NW={prow['t_NW']:.2f}")
@@ -138,17 +147,20 @@ def main() -> None:
     cm1 = make_cost_model(cfg, panel, 1.0)
     end = dev_end
     kw = dict(start=start, end=end)
+    bh_name, bh_asset = benchmarks(cfg)
+    ref_name, ref_series = next(iter(panel.reference.items()), (None, None))
+    strat = lambda spec: model_weights(model, spec, lv, rt, elig)  # noqa: E731
     print("[backtest] benchmarks")
-    ew_net = run("EW", lv, rt, cfg, cm1, mode="equal_weight", tax=False, **kw)
-    ew_tax = run("EW", lv, rt, cfg, cm1, mode="equal_weight", tax=True, **kw)
-    n50_tax = run("NIFTY50", lv, rt, cfg, cm1, mode="buy_hold:NIFTY50", tax=True, **kw)
+    ew_net = run("EW", lv, rt, cfg, cm1, weights_fn=equal_weight(elig), tax=False, **kw)
+    ew_tax = run("EW", lv, rt, cfg, cm1, weights_fn=equal_weight(elig), tax=True, **kw)
+    n50_tax = run(bh_name, lv, rt, cfg, cm1, weights_fn=buy_hold(bh_asset, lv.columns), tax=True, **kw)
     ew_m = st.monthly(ew_net.nav)
 
     nets, taxed = {}, {}
     for i, spec in enumerate(specs):
         print(f"[backtest] {i + 1:2d}/{len(specs)} {spec.name}")
-        nets[spec] = run(spec.name, lv, rt, cfg, cm1, spec=spec, tax=False, **kw)
-        taxed[spec] = run(spec.name, lv, rt, cfg, cm1, spec=spec, tax=True, **kw)
+        nets[spec] = run(spec.name, lv, rt, cfg, cm1, weights_fn=strat(spec), tax=False, **kw)
+        taxed[spec] = run(spec.name, lv, rt, cfg, cm1, weights_fn=strat(spec), tax=True, **kw)
 
     active_m = pd.DataFrame({s.name: st.monthly(nets[s].nav) - ew_m for s in specs}).dropna()
     rows = []
@@ -200,8 +212,8 @@ def main() -> None:
     cost_rows = []
     for m in cfg["evaluation"]["cost_multipliers"]:
         cm = make_cost_model(cfg, panel, m)
-        r_s = nets[prim] if m == 1 else run(prim.name, lv, rt, cfg, cm, spec=prim, tax=False, **kw)
-        r_b = ew_net if m == 1 else run("EW", lv, rt, cfg, cm, mode="equal_weight", tax=False, **kw)
+        r_s = nets[prim] if m == 1 else run(prim.name, lv, rt, cfg, cm, weights_fn=strat(prim), tax=False, **kw)
+        r_b = ew_net if m == 1 else run("EW", lv, rt, cfg, cm, weights_fn=equal_weight(elig), tax=False, **kw)
         ps, pb = st.perf(r_s.nav, rf), st.perf(r_b.nav, rf)
         act = st.monthly(r_s.nav) - st.monthly(r_b.nav)
         cost_rows.append({"cost_x": m, "CAGR": ps["CAGR"], "Sharpe": ps["Sharpe"], "EW_CAGR": pb["CAGR"],
@@ -225,12 +237,14 @@ def main() -> None:
     pnt = st.perf(n50_tax.nav, rf, n50_tax.after_tax_terminal)
     strategy_ok = bool(pp["CAGR"] > pe["CAGR"] and pp["Sharpe"] > 0.5 and pp["MaxDD"] >= pe["MaxDD"])
     tax_ok = bool(ppt["CAGR_after_tax"] > pet["CAGR_after_tax"])
-    m30 = panel.momentum30.loc[nets[prim].nav.index[0]:end].dropna()
-    m30_cagr = (m30.iloc[-1] / m30.iloc[0]) ** (365.25 / (m30.index[-1] - m30.index[0]).days) - 1
+    m30_cagr = np.nan
+    if ref_series is not None:
+        m30 = ref_series.loc[nets[prim].nav.index[0]:end].dropna()
+        m30_cagr = (m30.iloc[-1] / m30.iloc[0]) ** (365.25 / (m30.index[-1] - m30.index[0]).days) - 1
 
     # ---- Figures -----------------------------------------------------------------------------
     navs = pd.DataFrame({"Strategy (net)": nets[prim].nav, "EW (net)": ew_net.nav,
-                         "NIFTY 50 TR": n50_tax.nav})
+                         f"{bh_name} (buy & hold)": n50_tax.nav})
     navs = navs / navs.iloc[0]
     fig, ax = plt.subplots(2, 1, figsize=(10, 7), sharex=True, gridspec_kw={"height_ratios": [3, 1.3]})
     navs.plot(ax=ax[0], logy=True, lw=1.3)
@@ -240,9 +254,9 @@ def main() -> None:
     fig.tight_layout(); fig.savefig(FIG / "dev_equity_drawdown.png", dpi=130); plt.close(fig)
 
     fig, ax = plt.subplots(figsize=(10, 3.5))
-    ic_prim.plot(ax=ax, lw=0.6, alpha=0.6, label="monthly rank IC")
+    ic_prim.plot(ax=ax, lw=0.6, alpha=0.6, label="rank IC per decision")
     ic_prim.rolling(24).mean().plot(ax=ax, lw=1.8, label="24-month mean")
-    ax.axhline(0, color="k", lw=0.6); ax.legend(); ax.set_title(f"Rank IC, {prim.score}_{prim.lookback}")
+    ax.axhline(0, color="k", lw=0.6); ax.legend(); ax.set_title(f"Rank IC, {model.signal_key(prim)}")
     fig.tight_layout(); fig.savefig(FIG / "dev_ic.png", dpi=130); plt.close(fig)
 
     fig, axes = plt.subplots(1, 2, figsize=(11, 3.6))
@@ -279,7 +293,7 @@ def main() -> None:
 
     perf_tbl = pd.DataFrame({
         "Primary (net)": pp, "EW (net)": pe,
-        "Primary (after tax)": ppt, "EW (after tax)": pet, "NIFTY 50 B&H (after tax)": pnt,
+        "Primary (after tax)": ppt, "EW (after tax)": pet, f"{bh_name} B&H (after tax)": pnt,
     }).T
     fmt_pct = ["CAGR", "Vol", "MaxDD", "VaR95_d", "CVaR95_d", "Win_m", "CAGR_after_tax"]
     perf_fmt = perf_tbl.copy().astype(object)
@@ -318,7 +332,7 @@ def main() -> None:
         "Sharpe and Sortino are on returns in excess of the NIFTY 1D rate (6% p.a. before it exists). "
         "After-tax CAGR includes tax paid each April and tax on liquidating the book on the last day.", "",
         perf_fmt.to_markdown(), "",
-        f"NIFTY200 Momentum 30 (price index, no costs/tax, reference only): CAGR {pct(m30_cagr)} over the same window.", "",
+        f"Reference {ref_name} (price series, no costs/tax): CAGR {pct(m30_cagr)} over the same window." if ref_name else "", "",
         "![equity](figures/dev_equity_drawdown.png)", "",
         "## Signal research (monthly cross-sectional rank IC, development period)", "",
         "IC is Spearman correlation between the score at the decision close and the return from the next "
@@ -377,8 +391,9 @@ def main() -> None:
     art = OUT / "artifacts" / "dev"
     art.mkdir(parents=True, exist_ok=True)
     pd.DataFrame({"primary_net": nets[prim].nav, "primary_after_tax": taxed[prim].nav,
-                  "ew_net": ew_net.nav, "ew_after_tax": ew_tax.nav, "nifty50_after_tax": n50_tax.nav,
-                  "momentum30_price": panel.momentum30.reindex(nets[prim].nav.index),
+                  "ew_net": ew_net.nav, "ew_after_tax": ew_tax.nav, "market_after_tax": n50_tax.nav,
+                  "reference_price": (ref_series.reindex(nets[prim].nav.index) if ref_series is not None
+                                      else np.nan),
                   "rf": rf.reindex(nets[prim].nav.index)}).to_parquet(art / "nav.parquet")
     pd.DataFrame({s.name: nets[s].nav for s in specs}).to_parquet(art / "trial_nav.parquet")
     nets[prim].weights.to_parquet(art / "weights.parquet")
@@ -394,13 +409,15 @@ def main() -> None:
     costs.to_parquet(art / "cost_sensitivity.parquet")
     pd.DataFrame({k: v["series"] for k, v in wf.items()}).to_parquet(art / "walk_forward.parquet")
     (art / "stats.json").write_text(json.dumps({
+        "strategy_id": strategy_id, "model": cfg["model"],
+        "benchmark_names": {"market": bh_name, "reference": ref_name},
         "primary": prim.name, "start": str(start.date()), "end": str(dev_end.date()),
         "months": len(active_m), "n_trials": len(specs),
         "gates": [{"gate": g, "pass": ok, "evidence": ev} for g, ok, ev in gates], "killed": killed,
         "perf": {k: {m: (None if pd.isna(v) else float(v)) for m, v in d.items()}
                  for k, d in {"primary_net": pp, "ew_net": pe, "primary_after_tax": ppt,
-                              "ew_after_tax": pet, "nifty50_after_tax": pnt}.items()},
-        "momentum30_cagr": m30_cagr,
+                              "ew_after_tax": pet, "market_after_tax": pnt}.items()},
+        "reference_cagr": m30_cagr,
         "dsr": dsr, "dsr_best": dsr_best, "pbo": pbo, "haircut": haircut, "bootstrap_p": boot_p,
         "robustness": robustness,
         "walk_forward": {k: {"active_ann": v["active_ann"], "active_IR": v["active_IR"],
@@ -419,8 +436,9 @@ def main() -> None:
                "safety_margin": safety_total, "capacity_inr": cap}
     (OUT / "dev_summary.json").write_text(json.dumps(summary, indent=2))
     print("\n".join(f"  {g:10s} {'PASS' if ok else 'FAIL'}  {ev}" for g, ok, ev in gates))
-    print(f"  killed: {killed}\n-> results/REPORT_dev.md")
+    print(f"  killed: {killed}\n-> {OUT / 'REPORT_dev.md'}")
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+    main(sys.argv[1])

@@ -1,6 +1,8 @@
-# Single source of truth for the strategy. Pre-registered in HYPOTHESIS.md.
+# Single source of truth for this strategy. Pre-registered in HYPOTHESIS.md.
 strategy_id: india_etf_momentum
 setup_version: v1
+# Signal and portfolio logic: src/strategylab/models/<model>.py
+model: xsec_momentum
 
 periods:
   data_start: "2005-01-01"
@@ -12,7 +14,8 @@ periods:
 #         yahoo = ETF price itself (no index history available).
 # tax_class: equity | gold_silver | debt  (see tax section)
 universe:
-  calendar_master: NIFTY 50
+  calendar_master: NIFTY50          # asset id whose sessions define the calendar
+  cash_asset: CASH                   # risk-free rate for Sharpe (6% p.a. fallback before it exists)
   min_history_sessions: 252
   assets:
     - {id: NIFTY50,    source: nse,    index: "NIFTY 50",               etf: NIFTYBEES,  tax_class: equity}
@@ -34,9 +37,25 @@ universe:
     - {id: GSEC10Y,    source: nse_tr, index: "NIFTY 10 YR BENCHMARK G-SEC", etf: LTGILTBEES, tax_class: debt}
     - {id: CASH,       source: nse_tr, index: "NIFTY 1D RATE INDEX",    etf: LIQUIDBEES, tax_class: debt}
 
+# A string is an asset id held buy-and-hold (with costs and tax); a mapping is a
+# reference price series shown without costs or tax.
 benchmarks:
   nifty50: NIFTY50
   momentum30: {source: nse, index: "NIFTY200 MOMENTUM 30"}
+
+# Extreme daily moves (> 20%) that were checked against market history. The data
+# gate fails on any extreme move not listed here.
+data_notes:
+  explained_moves:
+    - {asset: REALTY,  date: 2008-10-24, reason: "Global financial crisis sell-off (NIFTY -6% that day)"}
+    - {asset: REALTY,  date: 2009-05-18, reason: "General-election result rally; market hit upper circuit"}
+    - {asset: PSUBANK, date: 2017-10-25, reason: "Rs 2.11 lakh crore PSU bank recapitalisation announced 24-Oct-2017"}
+    - {asset: SILVER,  date: 2026-02-02, reason: "Global silver crash at end of Jan 2026 after a parabolic rally"}
+  # Gate checks waived after inspection (added 2026-10-22, after the first data-gate run and
+  # before any change to the strategy specification). Each is a deviation from HYPOTHESIS.md.
+  waivers:
+    - {asset: GSEC10Y, check: ohlc, reason: "Close is the end-of-day valuation, high/low are traded prices; median gap 0.05%"}
+    - {asset: GSEC10Y, check: tracking, reason: "LTGILTBEES tracks NIFTY 8-13 yr G-Sec, not the 10 yr benchmark index; weekly corr 0.73"}
 
 decision:
   cadence: monthly_last_session      # decide on the close of the last NSE session of the month

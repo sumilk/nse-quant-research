@@ -1,7 +1,7 @@
 [project]
-name = "india-etf-momentum"
+name = "india-strategy-lab"
 version = "0.1.0"
-description = "Monthly cross-asset momentum rotation across Indian index ETFs"
+description = "Research lab for systematic strategies on Indian markets, built on the ML4T workflow"
 requires-python = ">=3.12"
 dependencies = [
     "matplotlib>=3.11.2",
@@ -21,7 +21,13 @@ dependencies = [
 requires = ["uv_build>=0.12.9,<0.13.0"]
 build-backend = "uv_build"
 
+[tool.uv.build-backend]
+module-name = "strategylab"
+
 [dependency-groups]
 dev = [
     "pytest>=9.1.1",
 ]
+
+[project.scripts]
+lab = "strategylab.cli:main"

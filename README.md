@@ -1,45 +1,83 @@
-# India ETF cross-asset momentum
+# India Strategy Lab
 
-This project tests one strategy on Indian index ETFs. Each month it ranks 18
-assets (NSE sector and size indices, gold, silver, a 10-year government bond
-index and overnight cash) by recent total return. It buys the top 4 in equal
-weight and rebalances at month-end. It is adapted from the ETF case study in
-*Machine Learning for Algorithmic Trading* (3rd ed.).
+A research lab for systematic strategies on Indian markets, built on the
+workflow in *Machine Learning for Algorithmic Trading* (3rd ed.).
 
-The hypothesis, universe, parameter grid, holdout window and pass/fail gates
-were fixed in [HYPOTHESIS.md](HYPOTHESIS.md) and committed before any backtest
-was run.
+Every strategy goes through the same steps:
 
-## Running it
+1. A pre-registered hypothesis, committed before any backtest.
+2. A data gate that checks the inputs.
+3. A signal test using IC with Newey-West standard errors.
+4. Backtests with no lookahead, Indian trading costs and Indian capital-gains
+   tax.
+5. Statistics that correct for having tried many variants: Deflated Sharpe
+   Ratio, probability of backtest overfitting (PBO), Sharpe haircut and
+   walk-forward selection.
+6. A holdout period that can be run once.
+
+## Strategies
+
+| Strategy | Model | Idea | Development result |
+|---|---|---|---|
+| [`india_etf_momentum`](strategies/india_etf_momentum/) | `xsec_momentum` | Monthly top-4 rotation across 18 NSE index ETFs (sectors, sizes, gold, silver, G-Sec, cash) by 6-month return | **Rejected.** IC t 1.43, Deflated Sharpe 0.08, trails equal weight after costs and tax ([report](strategies/india_etf_momentum/results/REPORT_dev.md)) |
+
+## Layout
+
+```
+strategies/<id>/            one folder per strategy
+  HYPOTHESIS.md             pre-registration (commit before any backtest)
+  config.yaml               universe, spec, grid, periods, costs, tax, gates
+  results/                  reports and figures (artifacts/ is regenerated, not committed)
+src/strategylab/
+  data/      fetch.py       NSE + Yahoo downloads, cached in data/raw, shared by all strategies
+             panel.py       per-strategy total-return panel on the NSE calendar
+             validate.py    data gate
+  engine/    schedule.py    decision schedule, point-in-time eligibility
+             backtest.py    daily loop: next-session fills, FIFO lots, cash, tax
+             costs.py       Indian delivery charges, spread, square-root impact
+             tax.py         STCG/LTCG, set-off, carry-forward
+  models/    xsec_momentum.py   signal + weights; register new models in models/__init__.py
+  evaluation/ research.py   development gates, 24-trial grid, report
+              holdout.py    one-shot holdout
+              current.py    ranking on the latest close
+              stats.py      performance, IC, DSR, PBO, bootstrap
+  app/       dashboard.py   Streamlit dashboard (comparison view + per-strategy tabs)
+  cli.py                    `lab` command
+tests/                      unit tests and a headless dashboard test
+```
+
+## Usage
 
 ```bash
 uv sync
-uv run python -m india_etf_momentum.data        # download NSE + Yahoo data (cached in data/raw)
-uv run python -m india_etf_momentum.research    # development period: gates, 24 trials, report
-uv run python -m india_etf_momentum.current     # ranking on the latest close
-uv run streamlit run src/india_etf_momentum/dashboard.py
+uv run lab list
+uv run lab fetch                                        # data for every strategy (cached)
+uv run lab research --strategy india_etf_momentum       # development period
+uv run lab current  --strategy india_etf_momentum       # ranking on the latest close
+uv run streamlit run src/strategylab/app/dashboard.py   # http://localhost:8501
 uv run pytest -q
 ```
 
-When you have reviewed the development gates and changed nothing, run the
-holdout. It can be run **once**:
+Run the holdout only after reviewing every development gate, with nothing
+changed since. It works once per strategy:
 
 ```bash
-uv run python -m india_etf_momentum.holdout --i-have-not-changed-anything
+uv run lab holdout --strategy india_etf_momentum --i-have-not-changed-anything
 ```
 
-## What the pipeline checks
+## Adding a strategy
 
-| Check | Where |
-|---|---|
-| Pre-registered hypothesis, kill criteria, trial count | `HYPOTHESIS.md`, `results/TRIALS.md` |
-| Data quality: OHLC consistency, gaps, stale runs, extreme moves, index-vs-ETF tracking | `validate.py` → `results/data_validation.md` |
-| No lookahead: signals read only closes up to the decision date; fills happen at the next session's close; a unit test changes future prices and confirms the signal does not move | `signals.py`, `tests/` |
-| Survivorship and universe: point-in-time eligibility (252 sessions of history); the remaining selection bias is documented | `signals.eligibility`, `HYPOTHESIS.md` |
-| Signal: monthly cross-sectional rank IC, Newey-West t-stat, both halves, decay | `research.py` |
-| Overfitting: all 24 grid cells reported, Deflated Sharpe Ratio, Sharpe haircut, probability of backtest overfitting (CSCV), walk-forward selection, a holdout usable once | `stats.py`, `research.py`, `holdout.py` |
-| Costs: STT, exchange and SEBI fees, stamp duty, GST, DP charge, half-spread by liquidity tier, square-root impact; 0–3× sensitivity; safety margin; capacity | `costs.py`, `research.py` |
-| Tax: STCG/LTCG for equity, gold/silver and debt ETFs; set-off; carry-forward; tax paid at each financial-year end; tax on liquidation | `tax.py`, `backtest.py` |
+1. **Model:** if no existing model fits, add `src/strategylab/models/<model>.py`
+   and register it in `models/__init__.py`. The model must define `Spec`,
+   `grid`, `primary`, `signal`, `signal_key` and `weights`.
+2. **Folder:** create `strategies/<id>/` with `config.yaml` (copy an existing
+   one) and `HYPOTHESIS.md`.
+3. **Pre-register:** commit the hypothesis, the grid and the gates before
+   running anything.
+4. **Run:** `uv run lab fetch`, then `uv run lab research --strategy <id>`.
+5. **Record changes:** a change to the specification after seeing results is a
+   new trial. Record it in `results/TRIALS.md`. Never edit the hypothesis to fit
+   the results.
 
 ## Data
 
@@ -47,7 +85,7 @@ uv run python -m india_etf_momentum.holdout --i-have-not-changed-anything
 |---|---|---|
 | Index prices | NSE `historicalOR/indicesHistory` | Price indices only |
 | Dividend yields | NSE `indicesYield` | Published from 2015/16 |
-| Gold, silver and ETF prices | Yahoo Finance | Also used for ETF liquidity |
+| ETF prices | Yahoo Finance | Isolated bad prints (e.g. around the Dec-2019 unit splits) are removed and reported |
 
 NSE does not publish total-return series through this API. Total return is
 approximated as price return plus a daily dividend accrual from the published
@@ -57,35 +95,32 @@ yield.
 
 - **Back-calculated index history:** NSE back-calculates sector index history
   before each index's launch date.
-- **Liquidity known today:** the universe was chosen by today's ETF liquidity,
-  and today's traded value is applied to all history for spreads, impact and
+- **Liquidity known today:** universes are chosen by today's ETF liquidity, and
+  today's traded value is applied to all history for spreads, impact and
   capacity.
 - **Today's tax rules on all history:** the rules in force after July 2024 are
   applied throughout. Tax is paid once a year rather than in advance-tax
   instalments.
-- **Index, not ETF:** the research trades the index. ETF tracking error and
-  expense ratios are reported in the data-validation report, not deducted from
-  returns.
+- **Index, not ETF:** strategies trade the index. ETF tracking difference
+  (expense ratio included) is reported in each data-validation report, not
+  deducted from returns.
 
 ## Docker
 
 ```bash
 docker compose build
-docker compose run --rm pipeline india_etf_momentum.data
-docker compose run --rm pipeline india_etf_momentum.research
-docker compose run --rm pipeline india_etf_momentum.current
+docker compose run --rm lab fetch
+docker compose run --rm lab research --strategy india_etf_momentum
 docker compose up -d dashboard            # http://localhost:8501
 docker build --target test .              # unit tests inside the image
 ```
 
-`data/` and `results/` are bind-mounted, so downloads and results are kept
-when the container is removed. `config/` and `HYPOTHESIS.md` are mounted
-read-only.
+`data/` and `strategies/` are bind-mounted, so downloads and results are kept
+on the host.
 
-The container runs as UID 1000. On a Linux host, create the two folders first
-with `mkdir -p data results` so they are writable. Docker Desktop on macOS
-handles this automatically.
+The container runs as UID 1000. On a Linux host, run `mkdir -p data` first so
+the folder is writable.
 
-NSE sometimes blocks requests from cloud or datacenter IP addresses. If the
-`data` job fails on a server, download the data on a local machine and copy
+NSE sometimes blocks requests from cloud or datacenter IP addresses. If
+`fetch` fails on a server, download the data on a local machine and copy
 `data/raw` across.

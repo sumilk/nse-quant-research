@@ -1,7 +1,8 @@
-"""Daily event loop for the monthly rotation.
+"""Daily event loop shared by every strategy.
 
+- A strategy supplies a weights function: decision date -> target weights.
 - Weights decided at the close of decision date d fill at the close of the
-  execution session (d + 1 session). Between those closes the old book earns
+  execution session (d + lag sessions). Between those closes the old book earns
   the return.
 - Positions are held as FIFO lots (units, cost, buy date) for tax.
 - Sells execute before buys; buys are scaled so cash never goes negative.
@@ -12,14 +13,41 @@
 from __future__ import annotations
 
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass, field
+from types import ModuleType
 
-import numpy as np
 import pandas as pd
 
-from .costs import CostModel
-from .signals import Spec, decision_schedule, eligibility, scores, target_weights
-from .tax import TaxBook, financial_year
+from strategylab.engine.costs import CostModel
+from strategylab.engine.schedule import decision_schedule
+from strategylab.engine.tax import TaxBook, financial_year
+
+WeightsFn = Callable[[pd.Timestamp], "pd.Series | None"]
+
+
+def model_weights(model: ModuleType, spec, levels: pd.DataFrame, returns: pd.DataFrame,
+                  elig: pd.DataFrame) -> WeightsFn:
+    sig = model.signal(levels, returns, spec)
+    return lambda d: model.weights(sig.loc[d], elig.loc[d], spec)
+
+
+def equal_weight(elig: pd.DataFrame) -> WeightsFn:
+    def fn(d):
+        e = elig.loc[d]
+        return e.astype(float) / e.sum() if e.sum() else None
+    return fn
+
+
+def buy_hold(asset: str, columns: pd.Index) -> WeightsFn:
+    state = {"done": False}
+
+    def fn(d):
+        if state["done"]:
+            return None
+        state["done"] = True
+        return pd.Series(0.0, index=columns).where(columns != asset, 1.0)
+    return fn
 
 
 @dataclass
@@ -81,20 +109,16 @@ def run(
     cfg: dict,
     cost_model: CostModel,
     *,
-    spec: Spec | None = None,
-    mode: str = "rank",              # "rank" | "equal_weight" | "buy_hold:<asset>"
+    weights_fn: WeightsFn,           # decision date -> target weights (None = no trade)
     start: pd.Timestamp,
     end: pd.Timestamp,
     tax: bool = True,
+    meta: dict | None = None,
 ) -> Result:
     cal = levels.index[(levels.index >= start) & (levels.index <= end)]
-    lag = cfg["decision"]["execution_lag_sessions"]
-    sched = decision_schedule(levels.index, lag)
+    sched = decision_schedule(levels.index, cfg["decision"]["execution_lag_sessions"], cfg["decision"]["cadence"])
     sched = sched[(sched["decision"] >= start) & (sched["execution"] <= end)]
     exec_to_dec = dict(zip(sched["execution"], sched["decision"]))
-
-    elig = eligibility(levels, returns, cfg["universe"]["min_history_sessions"])
-    sc = scores(levels, returns, spec) if spec is not None else None
     vol = returns.rolling(63, min_periods=21).std()
     tax_class = {a["id"]: a["tax_class"] for a in cfg["universe"]["assets"]}
     book_tax = TaxBook(cfg["tax"], tax_class)
@@ -102,27 +126,14 @@ def run(
     initial = float(cfg["portfolio"]["initial_capital_inr"])
     book = Book(initial)
     nav, cost_s, w_log, trades, tax_paid = {}, {}, {}, [], {}
-    bought_once = False
 
     for i, t in enumerate(cal):
         px = levels.loc[t]
         day_cost = 0.0
 
         if t in exec_to_dec:
-            d = exec_to_dec[t]
-            if mode == "rank":
-                w = target_weights(sc.loc[d], elig.loc[d], spec.top_k)
-            elif mode == "equal_weight":
-                w = target_weights(pd.Series(0.0, index=levels.columns), elig.loc[d], None)
-            elif mode.startswith("buy_hold:"):
-                asset = mode.split(":", 1)[1]
-                w = None if bought_once else pd.Series(0.0, index=levels.columns).where(
-                    levels.columns != asset, 1.0)
-            else:
-                raise ValueError(mode)
-
+            w = weights_fn(exec_to_dec[t])
             if w is not None and w.sum() > 0:
-                bought_once = True
                 w_log[t] = w
                 total = book.value(px)
                 cur = pd.Series({a: book.units(a) * px[a] for a in levels.columns})
@@ -188,5 +199,5 @@ def run(
         tax_paid=pd.Series(tax_paid, dtype=float),
         liquidation_tax=liq_tax,
         initial=initial,
-        meta={"spec": spec, "mode": mode, "tax": tax, "cost_multiplier": cost_model.multiplier},
+        meta={**(meta or {}), "tax": tax, "cost_multiplier": cost_model.multiplier},
     )

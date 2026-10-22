@@ -2,10 +2,11 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from india_etf_momentum.backtest import run
-from india_etf_momentum.costs import CostModel
-from india_etf_momentum.signals import Spec, decision_schedule, eligibility, scores, target_weights
-from india_etf_momentum.tax import TaxBook
+from strategylab.engine.backtest import buy_hold, model_weights, run
+from strategylab.engine.costs import CostModel
+from strategylab.engine.schedule import decision_schedule, eligibility
+from strategylab.engine.tax import TaxBook
+from strategylab.models import xsec_momentum as xm
 
 TAX_CFG = {
     "cess_pct": 4.0, "slab_rate_pct": 30.0,
@@ -32,7 +33,7 @@ def _panel(n=800, assets=("A", "B", "C", "D", "E", "F"), seed=0):
 
 def _cfg(assets):
     return {
-        "decision": {"execution_lag_sessions": 1},
+        "decision": {"execution_lag_sessions": 1, "cadence": "monthly_last_session"},
         "universe": {"min_history_sessions": 252,
                      "assets": [{"id": a, "tax_class": "equity"} for a in assets]},
         "tax": TAX_CFG, "portfolio": {"initial_capital_inr": 1_000_000},
@@ -41,13 +42,13 @@ def _cfg(assets):
 
 def test_scores_ignore_future_prices():
     lv, r = _panel()
-    spec = Spec("sharpe", 126, 21, 3)
+    spec = xm.Spec("sharpe", 126, 21, 3)
     d = lv.index[500]
-    base = scores(lv, r, spec).loc[d]
+    base = xm.signal(lv, r, spec).loc[d]
     lv2, r2 = lv.copy(), r.copy()
     r2.iloc[501:] *= -5
     lv2.iloc[501:] *= 3
-    assert scores(lv2, r2, spec).loc[d].equals(base)
+    assert xm.signal(lv2, r2, spec).loc[d].equals(base)
 
 
 def test_execution_is_after_decision_and_month_end():
@@ -60,7 +61,7 @@ def test_execution_is_after_decision_and_month_end():
 def test_top_k_respects_eligibility():
     score = pd.Series({"A": 5.0, "B": 4.0, "C": 3.0})
     elig = pd.Series({"A": False, "B": True, "C": True})
-    w = target_weights(score, elig, 1)
+    w = xm.weights(score, elig, xm.Spec("ret", 126, 0, 1))
     assert w["B"] == 1.0 and w.sum() == 1.0
 
 
@@ -98,7 +99,8 @@ def test_frictionless_buy_hold_matches_asset_return():
     lv, r = _panel()
     cfg = _cfg(lv.columns)
     cm = CostModel(COST_CFG, {a: 1e9 for a in lv.columns}, {a: "equity" for a in lv.columns}, multiplier=0)
-    res = run("bh", lv, r, cfg, cm, mode="buy_hold:A", start=lv.index[300], end=lv.index[-1], tax=False)
+    res = run("bh", lv, r, cfg, cm, weights_fn=buy_hold("A", lv.columns), start=lv.index[300], end=lv.index[-1],
+              tax=False)
     first_exec = res.weights.index[0]
     got = res.nav.iloc[-1] / res.nav.loc[first_exec]
     want = lv["A"].iloc[-1] / lv["A"].loc[first_exec]
@@ -109,6 +111,21 @@ def test_cash_never_negative_with_costs_and_tax():
     lv, r = _panel(n=1300)
     cfg = _cfg(lv.columns)
     cm = CostModel(COST_CFG, {a: 2e7 for a in lv.columns}, {a: "equity" for a in lv.columns})
-    res = run("rk", lv, r, cfg, cm, spec=Spec("ret", 126, 0, 2), start=lv.index[260], end=lv.index[-1])
+    elig = eligibility(lv, r, 252)
+    wf = model_weights(xm, xm.Spec("ret", 126, 0, 2), lv, r, elig)
+    res = run("rk", lv, r, cfg, cm, weights_fn=wf, start=lv.index[260], end=lv.index[-1])
     assert (res.nav > 0).all()
     assert res.costs.sum() > 0
+
+
+def test_every_strategy_config_is_consistent():
+    from strategylab.config import list_strategies, load_config, strategy_dir
+    from strategylab.models import load_model
+
+    for sid in list_strategies():
+        cfg = load_config(sid)
+        model = load_model(cfg["model"])
+        assert model.primary(cfg) in model.grid(cfg), f"{sid}: primary spec not in grid"
+        assert (strategy_dir(sid) / "HYPOTHESIS.md").exists(), f"{sid}: no pre-registration"
+        ids = {a["id"] for a in cfg["universe"]["assets"]}
+        assert cfg["universe"]["calendar_master"] in ids

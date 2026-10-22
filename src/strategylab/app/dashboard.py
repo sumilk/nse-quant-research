@@ -1,6 +1,7 @@
-"""Strategy dashboard. Reads results/artifacts written by research.py, holdout.py, current.py.
+"""Strategy dashboard. Reads strategies/<id>/results/artifacts written by the
+research, holdout and current stages.
 
-    uv run streamlit run src/india_etf_momentum/dashboard.py
+    uv run streamlit run src/strategylab/app/dashboard.py
 """
 
 from __future__ import annotations
@@ -13,26 +14,25 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
-import yaml
 
-ROOT = Path(__file__).resolve().parents[2]
-RES = ROOT / "results"
-ART = RES / "artifacts"
+from strategylab.config import list_strategies, results_dir, strategy_dir
 
 # Validated categorical order (dataviz reference palette): colour follows the entity.
-COLORS = {"Strategy": "#2a78d6", "EW": "#eb6834", "NIFTY 50": "#1baf7a", "Momentum 30": "#eda100",
-          "Walk-forward": "#e87ba4"}
+# Market and reference benchmark labels are added per strategy below.
+COLORS = {"Strategy": "#2a78d6", "EW": "#eb6834", "Walk-forward": "#e87ba4"}
+MARKET_COLOR, REFERENCE_COLOR = "#1baf7a", "#eda100"
+STRATEGY_COLORS = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#6250d6", "#e34948"]
 DIVERGING = [[0, "#d03b3b"], [0.5, "#f0efec"], [1, "#2a78d6"]]  # red <- gray -> blue
 GOOD, BAD = "✅ PASS", "❌ FAIL"
 
-st.set_page_config(page_title="India ETF Momentum", page_icon="📈", layout="wide")
+st.set_page_config(page_title="India Strategy Lab", page_icon="📈", layout="wide")
 
 
 # ----- loading ------------------------------------------------------------------------------
 
 @st.cache_data
-def load(stage: str) -> dict | None:
-    d = ART / stage
+def load(strategy_id: str, stage: str) -> dict | None:
+    d = results_dir(strategy_id) / "artifacts" / stage
     if not (d / "stats.json").exists():
         return None
     out = {"stats": json.loads((d / "stats.json").read_text())}
@@ -52,7 +52,7 @@ def num(v, d=2):
 def series_frame(nav: pd.DataFrame, after_tax: bool) -> pd.DataFrame:
     cols = {"Strategy": "primary_after_tax" if after_tax else "primary_net",
             "EW": "ew_after_tax" if after_tax else "ew_net",
-            "NIFTY 50": "nifty50_after_tax", "Momentum 30": "momentum30_price"}
+            MARKET: "market_after_tax", REFERENCE: "reference_price"}
     if "walkforward_net" in nav and not after_tax:
         cols["Walk-forward"] = "walkforward_net"
     df = pd.DataFrame({k: nav[v] for k, v in cols.items() if v in nav}).dropna(how="all")
@@ -101,21 +101,73 @@ def gate_badges(gates: list[dict]) -> None:
             st.caption(g["evidence"])
 
 
-# ----- page ---------------------------------------------------------------------------------
+# ----- strategy picker and cross-strategy comparison -----------------------------------------
 
-st.title("India ETF cross-asset momentum")
-dev = load("dev")
-hold = load("holdout")
+strategies = list_strategies()
+with st.sidebar:
+    st.header("India Strategy Lab")
+    choice = st.selectbox("Strategy", ["Compare all"] + strategies,
+                          index=1 if len(strategies) == 1 else 0)
+
+if choice == "Compare all":
+    st.title("Strategy comparison")
+    rows, curves = [], {}
+    for sid in strategies:
+        d = load(sid, "dev")
+        h = load(sid, "holdout")
+        if d is None:
+            rows.append({"strategy": sid, "status": "not researched"})
+            continue
+        ss = d["stats"]
+        p = ss["perf"]
+        rows.append({
+            "strategy": sid, "model": ss.get("model"), "primary": ss["primary"],
+            "status": "rejected" if ss["killed"] else "alive",
+            "gates passed": f"{sum(g['pass'] for g in ss['gates'])}/{len(ss['gates'])}",
+            "CAGR net": pct(p["primary_net"]["CAGR"]), "CAGR after tax": pct(p["primary_after_tax"].get("CAGR_after_tax")),
+            "EW CAGR": pct(p["ew_net"]["CAGR"]), "Sharpe": num(p["primary_net"]["Sharpe"]),
+            "Max DD": pct(p["primary_net"]["MaxDD"]), "DSR": num(ss["dsr"]["dsr"], 3), "PBO": num(ss["pbo"]["pbo"]),
+            "trials": ss["n_trials"], "holdout": ("—" if h is None else (GOOD if h["stats"]["pass"] else BAD)),
+            "period": f"{ss['start']} → {ss['end']}",
+        })
+        curves[sid] = d["nav"]["primary_net"]
+    st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+    st.caption("Development-period figures, net of costs. Each strategy is judged against its own "
+               "pre-registered gates; comparing strategies with each other is itself a selection step, "
+               "so count it as a trial before picking one to deploy.")
+    if curves:
+        cdf = pd.DataFrame(curves)
+        cdf = cdf / cdf.bfill().iloc[0]
+        for i, c in enumerate(cdf):
+            COLORS[c] = STRATEGY_COLORS[i % len(STRATEGY_COLORS)]
+        st.plotly_chart(line_chart(cdf, "Growth of ₹1, primary specs (each over its own development window)",
+                                   log=True), width="stretch")
+        if len(cdf.columns) > 1:
+            corr = cdf.resample("ME").last().pct_change().corr()
+            fig = px.imshow(corr, zmin=-1, zmax=1, color_continuous_scale=DIVERGING, text_auto=".2f",
+                            title="Correlation of monthly returns")
+            st.plotly_chart(fig, width="stretch")
+    st.info("Add a strategy: create strategies/<id>/ with config.yaml and HYPOTHESIS.md, commit the "
+            "pre-registration, then `uv run lab fetch` and `uv run lab research --strategy <id>`.")
+    st.stop()
+
+SID = choice
+dev = load(SID, "dev")
+hold = load(SID, "holdout")
 cur = None
-if (ART / "current" / "ranking.parquet").exists():
-    cur = (pd.read_parquet(ART / "current" / "ranking.parquet"),
-           json.loads((ART / "current" / "meta.json").read_text()))
+cur_dir = results_dir(SID) / "artifacts" / "current"
+if (cur_dir / "ranking.parquet").exists():
+    cur = (pd.read_parquet(cur_dir / "ranking.parquet"), json.loads((cur_dir / "meta.json").read_text()))
 
+st.title(SID.replace("_", " ").title())
 if dev is None:
-    st.warning("No results yet. Run `uv run python -m india_etf_momentum.research` first.")
+    st.warning(f"No results yet. Run `uv run lab research --strategy {SID}` first.")
     st.stop()
 
 s = dev["stats"]
+MARKET = f"{s['benchmark_names']['market']} (buy & hold)"
+REFERENCE = s["benchmark_names"].get("reference") or "Reference"
+COLORS[MARKET], COLORS[REFERENCE] = MARKET_COLOR, REFERENCE_COLOR
 with st.sidebar:
     st.header("View")
     period = st.radio("Period", ["Development", "Holdout"] if hold else ["Development"],
@@ -153,7 +205,7 @@ with tabs[0]:
                     f"{GOOD if hs['pass'] else BAD} — after-tax active CAGR {pct(hs['after_tax_active_cagr'], 2)}")
     else:
         st.info("Holdout not yet used. When every development gate has been reviewed, run "
-                "`uv run python -m india_etf_momentum.holdout --i-have-not-changed-anything` (one time only).",
+                f"`uv run lab holdout --strategy {SID} --i-have-not-changed-anything` (one time only).",
                 icon="🔒")
 
     st.subheader(f"Headline numbers — {period.lower()}, {'after tax' if after_tax else 'pre-tax, net of costs'}")
@@ -177,19 +229,19 @@ with tabs[0]:
     else:
         k[4].metric("Months", len(act.dropna()))
         k[5].metric("Hit rate vs EW", pct((act.dropna() > 0).mean(), 0))
-    st.plotly_chart(line_chart(frame, "Growth of ₹1", log=log_scale), use_container_width=True)
+    st.plotly_chart(line_chart(frame, "Growth of ₹1", log=log_scale), width="stretch")
     if s.get("suspicious_ic"):
         st.warning("Mean IC above 0.15 — treat as a probable bug or lookahead.")
 
 # ----- Performance ----------------------------------------------------------------------------
 with tabs[1]:
     st.subheader("Risk and return")
-    st.dataframe(perf_table(frame, rf), use_container_width=True)
-    st.caption("Sharpe/Sortino on returns in excess of the NIFTY 1D rate index (6% p.a. before 2011). "
-               "Momentum 30 is a price index with no costs or tax, for reference only.")
+    st.dataframe(perf_table(frame, rf), width="stretch")
+    st.caption("Sharpe/Sortino on returns in excess of the strategy's cash asset (6% p.a. before it has history). "
+               f"{REFERENCE} is a price series with no costs or tax, for reference only.")
 
     dd = frame / frame.cummax() - 1
-    st.plotly_chart(line_chart(dd, "Drawdown", yfmt=".0%", height=300), use_container_width=True)
+    st.plotly_chart(line_chart(dd, "Drawdown", yfmt=".0%", height=300), width="stretch")
 
     m = frame.resample("ME").last().pct_change().dropna(how="all")
     w = roll_win
@@ -198,10 +250,10 @@ with tabs[1]:
     roll["Active IR vs EW"] = roll_act.mean() / roll_act.std() * np.sqrt(12)
     c1, c2 = st.columns(2)
     c1.plotly_chart(line_chart(roll.drop(columns="Active IR vs EW"), f"Rolling {w}-month Sharpe (raw)", height=320),
-                    use_container_width=True)
+                    width="stretch")
     fig = line_chart(roll[["Active IR vs EW"]], f"Rolling {w}-month active IR vs EW", height=320)
     fig.update_traces(line_color=COLORS["Strategy"]); fig.add_hline(y=0, line_width=1, line_color="gray")
-    c2.plotly_chart(fig, use_container_width=True)
+    c2.plotly_chart(fig, width="stretch")
 
     yr = frame.resample("YE").last()
     yr = pd.concat([frame.iloc[[0]], yr]).pct_change().dropna(how="all")
@@ -210,7 +262,7 @@ with tabs[1]:
     fig = px.bar(yl, x="Year", y="Return", color="Series", barmode="group", color_discrete_map=COLORS,
                  title="Calendar-year returns (first and last years partial)")
     fig.update_yaxes(tickformat=".0%"); fig.update_layout(height=380, legend_title=None)
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
     sm = m["Strategy"].dropna()
     hm = pd.DataFrame({"Year": sm.index.year, "Month": sm.index.strftime("%b"), "r": sm.values})
@@ -220,14 +272,14 @@ with tabs[1]:
     fig = px.imshow(hm, color_continuous_scale=DIVERGING, zmin=-lim, zmax=lim, text_auto=".1%", aspect="auto",
                     title="Strategy monthly returns")
     fig.update_layout(height=40 + 26 * len(hm), coloraxis_colorbar_tickformat=".0%")
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
     c1, c2 = st.columns(2)
     am = (m["Strategy"] - m["EW"]).dropna()
     fig = px.histogram(am, nbins=40, title="Monthly active return vs EW", color_discrete_sequence=[COLORS["Strategy"]])
     fig.update_xaxes(tickformat=".0%"); fig.update_layout(showlegend=False, height=320)
     fig.add_vline(x=0, line_color="gray")
-    c1.plotly_chart(fig, use_container_width=True)
+    c1.plotly_chart(fig, width="stretch")
     up = m["EW"] > 0
     cap = pd.DataFrame({"EW up months": [m.loc[up, "Strategy"].mean(), m.loc[up, "EW"].mean()],
                         "EW down months": [m.loc[~up, "Strategy"].mean(), m.loc[~up, "EW"].mean()]},
@@ -236,7 +288,7 @@ with tabs[1]:
                  y="Avg monthly return", color="Series", barmode="group", color_discrete_map=COLORS,
                  title="Up/down capture vs EW")
     fig.update_yaxes(tickformat=".1%"); fig.update_layout(height=320, legend_title=None)
-    c2.plotly_chart(fig, use_container_width=True)
+    c2.plotly_chart(fig, width="stretch")
 
 # ----- Holdings & trading ---------------------------------------------------------------------
 with tabs[2]:
@@ -249,14 +301,14 @@ with tabs[2]:
                   color_discrete_sequence=px.colors.qualitative.Safe)
     fig.update_yaxes(tickformat=".0%"); fig.update_layout(height=420, legend_title=None)
     fig.update_traces(line_width=0)
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
     st.caption("More than eight assets share this chart, so colours are not unique per asset; hover for the name.")
 
     c1, c2 = st.columns(2)
     freq = (wts > 0).mean().sort_values()
     fig = px.bar(freq, orientation="h", title="Share of months held", color_discrete_sequence=[COLORS["Strategy"]])
     fig.update_xaxes(tickformat=".0%"); fig.update_layout(showlegend=False, height=420, yaxis_title=None)
-    c1.plotly_chart(fig, use_container_width=True)
+    c1.plotly_chart(fig, width="stretch")
     tr = data["trades"]
     tr = tr[tr["side"] != "sell_tax"].copy()
     tr["year"] = pd.to_datetime(tr["date"]).dt.year
@@ -264,7 +316,7 @@ with tabs[2]:
     to = (tr.groupby("year")["value"].sum() / 2 / navs.groupby(navs.index.year).mean()).dropna()
     fig = px.bar(to, title="One-way turnover per year (× average NAV)", color_discrete_sequence=[COLORS["Strategy"]])
     fig.update_layout(showlegend=False, height=420, yaxis_title=None, xaxis_title=None)
-    c2.plotly_chart(fig, use_container_width=True)
+    c2.plotly_chart(fig, width="stretch")
 
     last = wts.iloc[-1]
     st.markdown(f"**Last rebalance ({wts.index[-1].date()})**: " +
@@ -272,7 +324,7 @@ with tabs[2]:
     with st.expander("All trades"):
         assets = st.multiselect("Asset", sorted(tr["asset"].unique()))
         view = tr[tr["asset"].isin(assets)] if assets else tr
-        st.dataframe(view.drop(columns="year"), use_container_width=True, hide_index=True,
+        st.dataframe(view.drop(columns="year"), width="stretch", hide_index=True,
                      column_config={c: st.column_config.NumberColumn(format="₹%.0f")
                                     for c in ["value", "explicit", "spread", "impact", "total"]})
 
@@ -284,11 +336,11 @@ with tabs[3]:
     cy = tr_all.groupby("year")[["explicit", "spread", "impact"]].sum()
     fig = px.bar(cy, title="Trading cost by year (₹)", color_discrete_sequence=["#2a78d6", "#eb6834", "#1baf7a"])
     fig.update_layout(height=360, legend_title=None, yaxis_title=None, xaxis_title=None)
-    c1.plotly_chart(fig, use_container_width=True)
+    c1.plotly_chart(fig, width="stretch")
     tot = cy.sum()
     c2.markdown("**Cost split over the period**")
     c2.dataframe(pd.DataFrame({"₹": tot.map(lambda v: f"{v:,.0f}"), "share": (tot / tot.sum()).map(pct)}),
-                 use_container_width=True)
+                 width="stretch")
     if period == "Development":
         c2.metric("Safety margin (gross active ÷ cost drag)", f"{s['safety_margin']:.1f}×",
                   help="Transaction-costs skill: needs ≥ 2.5×")
@@ -304,7 +356,7 @@ with tabs[3]:
         fig.update_layout(title="Cost sensitivity (0× = frictionless, 3× = stress)", height=340,
                           hovermode="x unified", xaxis_title="cost multiplier")
         fig.update_yaxes(tickformat=".1%")
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
     st.subheader("Tax")
     if period == "Development" and "tax_paid" in dev:
@@ -312,12 +364,12 @@ with tabs[3]:
         tp.index = [f"FY{d.year - 1}-{str(d.year)[2:]}" for d in pd.to_datetime(tp.index)]
         fig = px.bar(tp.fillna(0), barmode="group", color_discrete_map=COLORS, title="Tax paid per financial year (₹)")
         fig.update_layout(height=360, legend_title=None, yaxis_title=None)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
         p = s["perf"]
         st.markdown(
             f"- After-tax CAGR: strategy **{pct(p['primary_after_tax'].get('CAGR_after_tax'))}**, "
-            f"EW {pct(p['ew_after_tax'].get('CAGR_after_tax'))}, NIFTY 50 buy & hold "
-            f"{pct(p['nifty50_after_tax'].get('CAGR_after_tax'))}\n"
+            f"EW {pct(p['ew_after_tax'].get('CAGR_after_tax'))}, {MARKET} "
+            f"{pct(p['market_after_tax'].get('CAGR_after_tax'))}\n"
             f"- Tax drag on the strategy: {pct(p['primary_net']['CAGR'] - p['primary_after_tax']['CAGR_after_tax'], 2)} "
             f"a year (pre-tax net CAGR minus after-tax CAGR)\n"
             f"- Tax still owed if the book were sold on the last day: ₹{s['liquidation_tax']:,.0f} "
@@ -330,7 +382,7 @@ with tabs[4]:
     ic = dev["ic_table"]
     st.subheader("Cross-sectional rank IC (development period)")
     st.dataframe(ic.style.format({c: "{:.3f}" for c in ic.columns if c not in ("signal", "n")}),
-                 use_container_width=True, hide_index=True)
+                 width="stretch", hide_index=True)
     st.caption("Gate: primary signal Newey-West t > 2 and the same sign in both halves. "
                "Typical cross-sectional ICs are 0.02–0.05; above 0.10 suspect lookahead.")
     ics = dev["ic_series"]["ic"]
@@ -340,18 +392,18 @@ with tabs[4]:
                              line=dict(color=COLORS["Strategy"], width=2)))
     fig.update_layout(title=f"Primary signal rank IC ({s['primary'].rsplit('_top', 1)[0]})", height=360,
                       hovermode="x unified", legend=dict(orientation="h", y=1.02, x=1, xanchor="right", yanchor="bottom"))
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
     c1, c2 = st.columns(2)
     dec = ic.set_index("signal")[["IC_1m", "IC_3m", "IC_6m", "IC_12m"]]
     dl = dec.reset_index().melt("signal", var_name="Horizon", value_name="Mean IC")
     fig = px.line(dl, x="Horizon", y="Mean IC", color="signal", markers=True, title="IC decay by forward horizon")
     fig.update_layout(height=360, legend_title=None)
-    c1.plotly_chart(fig, use_container_width=True)
+    c1.plotly_chart(fig, width="stretch")
     by_year = ics.groupby(ics.index.year).mean()
     fig = px.bar(by_year, title="Mean IC by year", color=by_year.values > 0,
                  color_discrete_map={True: "#2a78d6", False: "#d03b3b"})
     fig.update_layout(showlegend=False, height=360, yaxis_title=None, xaxis_title=None)
-    c2.plotly_chart(fig, use_container_width=True)
+    c2.plotly_chart(fig, width="stretch")
 
 # ----- Robustness ------------------------------------------------------------------------------------
 with tabs[5]:
@@ -383,7 +435,7 @@ with tabs[5]:
                         text_auto=".2f" if metric in ("active_IR", "Sharpe_net") else ".1%",
                         title=f"score = {score}", aspect="auto")
         fig.update_layout(height=330, coloraxis_showscale=False)
-        col.plotly_chart(fig, use_container_width=True)
+        col.plotly_chart(fig, width="stretch")
     st.caption("Every cell is a trial. A primary spec surrounded by much weaker neighbours (a cliff) "
                "or sitting on the edge of the grid is a sign of overfitting.")
 
@@ -401,13 +453,13 @@ with tabs[5]:
                              line=dict(width=2.5, color=COLORS["Strategy"])))
     fig.update_layout(title="All 24 trials (grey) vs primary and EW, net of costs", height=420)
     fig.update_yaxes(type="log" if log_scale else "linear")
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
     show = trials.drop(columns=["score", "lookback", "top_k"]).sort_values("active_IR", ascending=False)
     st.dataframe(show.style.format({"CAGR_net": "{:.1%}", "MaxDD": "{:.1%}", "CAGR_after_tax": "{:.1%}",
                                     "active_ann": "{:.2%}", "Sharpe_net": "{:.2f}", "Calmar": "{:.2f}",
                                     "active_IR": "{:.2f}", "turnover_pa": "{:.2f}"}),
-                 use_container_width=True, hide_index=True)
+                 width="stretch", hide_index=True)
 
     st.subheader("Walk-forward selection (trial 25)")
     wf = s["walk_forward"]
@@ -424,13 +476,13 @@ with tabs[5]:
     fig.update_traces(selector=dict(name="Primary"), line_color=COLORS["Strategy"])
     fig.update_traces(selector=dict(name="Walk-forward (expanding)"), line_color=COLORS["Walk-forward"])
     fig.update_traces(selector=dict(name="Walk-forward (rolling)"), line_color="#6250d6")
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
     st.caption("Picks by year (expanding): " + ", ".join(f"{y}: {p}" for y, p in wf["expanding"]["picks"]))
 
 # ----- Next rebalance -----------------------------------------------------------------------------
 with tabs[6]:
     if cur is None:
-        st.info("Run `uv run python -m india_etf_momentum.current` to score the universe on the latest close.")
+        st.info(f"Run `uv run lab current --strategy {SID}` to score the universe on the latest close.")
     else:
         rk, meta = cur
         st.subheader(f"Ranking on {meta['asof']} — {meta['spec']}")
@@ -443,8 +495,8 @@ with tabs[6]:
                      color_discrete_map={True: COLORS["Strategy"], False: "#c3c2b7"}, title="Signal score")
         fig.update_layout(showlegend=False, height=520, yaxis_title=None)
         fig.update_xaxes(tickformat=".0%" if meta["spec"].startswith("ret") else ".2f")
-        st.plotly_chart(fig, use_container_width=True)
-        st.dataframe(rk, use_container_width=True, hide_index=True,
+        st.plotly_chart(fig, width="stretch")
+        st.dataframe(rk, width="stretch", hide_index=True,
                      column_config={"score": st.column_config.NumberColumn(format="%.3f"),
                                     "target_weight": st.column_config.NumberColumn(format="%.2f"),
                                     "vol_63d_ann": st.column_config.NumberColumn(format="%.3f"),
@@ -453,7 +505,7 @@ with tabs[6]:
 
 # ----- Data quality --------------------------------------------------------------------------------
 with tabs[7]:
-    f = RES / "data_validation.md"
+    f = results_dir(SID) / "data_validation.md"
     st.markdown(f.read_text() if f.exists() else "Not generated yet.")
 
 # ----- Assumptions ---------------------------------------------------------------------------------
@@ -461,10 +513,10 @@ with tabs[8]:
     c1, c2 = st.columns(2)
     with c1:
         st.subheader("Pre-registration")
-        st.markdown((ROOT / "HYPOTHESIS.md").read_text())
+        st.markdown((strategy_dir(SID) / "HYPOTHESIS.md").read_text())
     with c2:
-        st.subheader("config/strategy.yaml")
-        st.code((ROOT / "config" / "strategy.yaml").read_text(), language="yaml")
-        t = RES / "TRIALS.md"
+        st.subheader(f"strategies/{SID}/config.yaml")
+        st.code((strategy_dir(SID) / "config.yaml").read_text(), language="yaml")
+        t = results_dir(SID) / "TRIALS.md"
         if t.exists():
             st.markdown(t.read_text())

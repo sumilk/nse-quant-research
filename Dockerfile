@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 # One image for the pipeline jobs and the Streamlit dashboard.
-#   docker build -t india-etf-momentum .
+#   docker build -t india-strategy-lab .
 #   docker build --target test .          # runs the unit tests during the build
 
 FROM python:3.12-slim-bookworm AS base
@@ -17,11 +17,11 @@ COPY pyproject.toml uv.lock .python-version ./
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-dev --no-install-project
 
-# Code, config and the pre-registration. The project is installed editable on
-# purpose: modules locate config/, data/ and results/ relative to /app.
+# Code and the strategies (configs + pre-registrations). Installed editable on
+# purpose: modules locate strategies/ and data/ relative to /app.
 COPY src ./src
-COPY config ./config
-COPY HYPOTHESIS.md README.md ./
+COPY strategies ./strategies
+COPY README.md ./
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-dev
 
@@ -34,14 +34,14 @@ RUN uv run --frozen pytest -q tests
 
 FROM base AS runtime
 RUN useradd --create-home --uid 1000 app \
-    && mkdir -p /app/data /app/results \
-    && chown -R app:app /app/data /app/results
+    && mkdir -p /app/data \
+    && chown -R app:app /app/data /app/strategies
 USER app
 ENV PATH="/app/.venv/bin:$PATH"
-VOLUME ["/app/data", "/app/results"]
+VOLUME ["/app/data"]
 EXPOSE 8501
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8501/_stcore/health', timeout=4)" || exit 1
-CMD ["streamlit", "run", "src/india_etf_momentum/dashboard.py", \
+CMD ["streamlit", "run", "src/strategylab/app/dashboard.py", \
      "--server.address=0.0.0.0", "--server.port=8501", "--server.headless=true", \
      "--browser.gatherUsageStats=false"]
