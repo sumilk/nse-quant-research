@@ -46,6 +46,11 @@ def main(strategy_id: str, confirm: bool) -> None:
     first = lv.index[lv.index < start][-1]
     end = lv.index[-1]
     elig = eligibility(lv, rt, cfg["universe"]["min_history_sessions"])
+    ew_elig = elig
+    if cfg["evaluation"].get("ew_universe", "all") == "risky":
+        risky = [a["id"] for a in cfg["universe"]["assets"] if a.get("role", "risky") == "risky"]
+        ew_elig = elig & pd.Series(elig.columns.isin(risky), index=elig.columns)
+    g = cfg.get("gates", {"type": "relative_return"})
     cm = make_cost_model(cfg, panel, 1.0)
     prim = model.primary(cfg)
     wf_name = dev["walk_forward"]["expanding"]["picks"][-1][1]
@@ -54,12 +59,12 @@ def main(strategy_id: str, confirm: bool) -> None:
     kw = dict(start=first, end=end)
 
     res = {
-        "primary_net": run(prim.name, lv, rt, cfg, cm, weights_fn=model_weights(model, prim, lv, rt, elig), tax=False, **kw),
-        "primary_after_tax": run(prim.name, lv, rt, cfg, cm, weights_fn=model_weights(model, prim, lv, rt, elig), tax=True, **kw),
-        "ew_net": run("EW", lv, rt, cfg, cm, weights_fn=equal_weight(elig), tax=False, **kw),
-        "ew_after_tax": run("EW", lv, rt, cfg, cm, weights_fn=equal_weight(elig), tax=True, **kw),
+        "primary_net": run(prim.name, lv, rt, cfg, cm, weights_fn=model_weights(model, prim, lv, rt, elig, cfg), tax=False, **kw),
+        "primary_after_tax": run(prim.name, lv, rt, cfg, cm, weights_fn=model_weights(model, prim, lv, rt, elig, cfg), tax=True, **kw),
+        "ew_net": run("EW", lv, rt, cfg, cm, weights_fn=equal_weight(ew_elig), tax=False, **kw),
+        "ew_after_tax": run("EW", lv, rt, cfg, cm, weights_fn=equal_weight(ew_elig), tax=True, **kw),
         "market_after_tax": run(bh_name, lv, rt, cfg, cm, weights_fn=buy_hold(bh_asset, lv.columns), tax=True, **kw),
-        "walkforward_net": run(wf_spec.name, lv, rt, cfg, cm, weights_fn=model_weights(model, wf_spec, lv, rt, elig),
+        "walkforward_net": run(wf_spec.name, lv, rt, cfg, cm, weights_fn=model_weights(model, wf_spec, lv, rt, elig, cfg),
                                tax=False, **kw),
     }
 
@@ -69,7 +74,13 @@ def main(strategy_id: str, confirm: bool) -> None:
         perf[k] = {m: (None if pd.isna(v) else float(v)) for m, v in p.items()}
     active = st.monthly(res["primary_net"].nav) - st.monthly(res["ew_net"].nav)
     a_tax = perf["primary_after_tax"]["CAGR_after_tax"] - perf["ew_after_tax"]["CAGR_after_tax"]
-    passed = bool(a_tax > 0)
+    if g["type"] == "relative_return":
+        passed = bool(a_tax > 0)
+        rule = "after-tax CAGR above EW's"
+    else:
+        dd_s, dd_e = perf["primary_after_tax"]["MaxDD"], perf["ew_after_tax"]["MaxDD"]
+        passed = bool(dd_s >= dd_e and a_tax >= -g["tax_cagr_tolerance_pp"] / 100)
+        rule = f"after-tax MaxDD no deeper than EW's and CAGR within {g['tax_cagr_tolerance_pp']} pp of EW's"
 
     art.mkdir(parents=True, exist_ok=True)
     ref = next(iter(panel.reference.values()), None)
@@ -84,7 +95,7 @@ def main(strategy_id: str, confirm: bool) -> None:
         "start": str(idx[0].date()), "end": str(end.date()), "perf": perf,
         "active_monthly_mean_ann": float(active.mean() * 12),
         "active_IR": float(active.mean() / active.std() * np.sqrt(12)) if active.std() > 0 else None,
-        "after_tax_active_cagr": a_tax, "pass": passed,
+        "after_tax_active_cagr": a_tax, "pass_rule": rule, "pass": passed,
     }, indent=2))
     marker.write_text(datetime.now().isoformat(timespec="seconds"))
     print(f"[{strategy_id}] holdout {idx[0].date()}..{end.date()}: after-tax active CAGR {a_tax:+.2%} "

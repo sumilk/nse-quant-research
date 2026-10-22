@@ -126,3 +126,31 @@ def block_bootstrap_p(x: pd.Series, draws: int, block: int = 6, seed: int = 7) -
     idx = (starts[:, :, None] + np.arange(block)) % n
     boot = centred[idx.reshape(draws, -1)[:, :n]].mean(1)
     return float((boot >= v.mean()).mean())
+
+
+def ts_spread_series(signal: pd.DataFrame, fwd_excess: pd.DataFrame, elig: pd.DataFrame, dates) -> pd.DataFrame:
+    """Per decision: mean forward excess return of assets whose signal is on (> 0) minus those off.
+
+    Rows where every asset is on (or every asset is off) have no spread and are dropped.
+    """
+    out = {}
+    for d in dates:
+        ok = elig.loc[d] & signal.loc[d].notna() & fwd_excess.loc[d].notna()
+        s, f = signal.loc[d][ok], fwd_excess.loc[d][ok]
+        on, off = f[s > 0], f[s <= 0]
+        out[d] = {"spread": on.mean() - off.mean() if len(on) and len(off) else np.nan,
+                  "on_mean": on.mean() if len(on) else np.nan, "off_mean": off.mean() if len(off) else np.nan,
+                  "share_on": len(on) / len(f) if len(f) else np.nan}
+    return pd.DataFrame(out).T.astype(float)
+
+
+def sharpe_diff_bootstrap_p(a: pd.Series, b: pd.Series, draws: int, block: int = 6, seed: int = 7) -> float:
+    """One-sided p-value for Sharpe(a) > Sharpe(b): paired circular block bootstrap, share of draws <= 0."""
+    df = pd.concat([a, b], axis=1).dropna().to_numpy()
+    n = len(df)
+    rng = np.random.default_rng(seed)
+    starts = rng.integers(0, n, size=(draws, int(np.ceil(n / block))))
+    idx = ((starts[:, :, None] + np.arange(block)) % n).reshape(draws, -1)[:, :n]
+    x = df[idx]                                   # draws x n x 2
+    sr = x.mean(1) / x.std(1, ddof=1)
+    return float((sr[:, 0] - sr[:, 1] <= 0).mean())

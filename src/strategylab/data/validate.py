@@ -50,7 +50,8 @@ def validate(p: Panel, cfg: dict, out: Path) -> tuple[bool, str]:
             off_cal = int((~o.index.isin(p.calendar)).sum())
             row["off_calendar"] = off_cal
         else:
-            e = p.etf[a["etf"]]["adj_close"]
+            # Check the series the panel actually uses (ETF price, or fund NAV for amfi sources).
+            e = p.levels[aid].dropna() if a["source"] == "amfi" else p.etf[a["etf"]]["adj_close"]
             row.update(high_lt_low=0, close_outside_hl=0, stale_runs=_stale_runs(e),
                        off_calendar=int((~e.index.isin(p.calendar)).sum()))
         big = r[r.abs() > EXTREME_INDEX_MOVE]
@@ -96,8 +97,11 @@ def validate(p: Panel, cfg: dict, out: Path) -> tuple[bool, str]:
              "## Extreme daily moves (> 20%)", ""]
     lines += [f"- {a} {d}: {v} — {why or '**UNEXPLAINED**'}" for a, d, v, why in extremes] or ["- none"]
     spikes = {t: ds for t, ds in p.etf_spikes.items() if ds}
-    lines += ["", "## ETF prints removed (more than 3x from the 11-session median)", ""]
+    lines += ["", "## One-off prints removed (more than 3x from the 11-session median)", ""]
     lines += [f"- {t}: {', '.join(str(d.date()) for d in ds)}" for t, ds in spikes.items()] or ["- none"]
+    rebased = {t: ev for t, ev in p.rebases.items() if ev}
+    lines += ["", "## Persistent level jumps undone (splits, face-value changes; earlier history rescaled)", ""]
+    lines += [f"- {t}: " + ", ".join(f"{d.date()} x{r:,.2f}" for d, r in ev) for t, ev in rebased.items()] or ["- none"]
     lines += ["", "## Failures", ""] + ([f"- {f}" for f in failures] or ["- none"])
     lines += ["", "## Waived (documented in config data_notes.waivers)", ""] + ([f"- {w}" for w in waived] or ["- none"])
     lines += ["", "## Notes", "",

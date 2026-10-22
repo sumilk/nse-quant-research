@@ -27,9 +27,9 @@ WeightsFn = Callable[[pd.Timestamp], "pd.Series | None"]
 
 
 def model_weights(model: ModuleType, spec, levels: pd.DataFrame, returns: pd.DataFrame,
-                  elig: pd.DataFrame) -> WeightsFn:
-    sig = model.signal(levels, returns, spec)
-    return lambda d: model.weights(sig.loc[d], elig.loc[d], spec)
+                  elig: pd.DataFrame, cfg: dict) -> WeightsFn:
+    sig = model.signal(levels, returns, spec, cfg)
+    return lambda d: model.weights(sig.loc[d], elig.loc[d], spec, cfg)
 
 
 def equal_weight(elig: pd.DataFrame) -> WeightsFn:

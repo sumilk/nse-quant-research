@@ -10,6 +10,9 @@ import numpy as np
 import pandas as pd
 
 
+SIGNAL_TEST = "cross_sectional"
+
+
 @dataclass(frozen=True)
 class Spec:
     score: str      # "ret" | "sharpe"
@@ -36,7 +39,7 @@ def primary(cfg: dict) -> Spec:
     return Spec(p["score"], p["lookback"], p["skip"], p["top_k"])
 
 
-def signal(levels: pd.DataFrame, returns: pd.DataFrame, spec: Spec) -> pd.DataFrame:
+def signal(levels: pd.DataFrame, returns: pd.DataFrame, spec: Spec, cfg: dict | None = None) -> pd.DataFrame:
     end = levels.shift(spec.skip)
     start = levels.shift(spec.skip + spec.lookback)
     ret = end / start - 1
@@ -48,7 +51,7 @@ def signal(levels: pd.DataFrame, returns: pd.DataFrame, spec: Spec) -> pd.DataFr
     raise ValueError(spec.score)
 
 
-def weights(signal_row: pd.Series, eligible_row: pd.Series, spec: Spec) -> pd.Series:
+def weights(signal_row: pd.Series, eligible_row: pd.Series, spec: Spec, cfg: dict | None = None) -> pd.Series:
     s = signal_row.where(eligible_row).dropna()
     chosen = s.sort_values(ascending=False).index[: spec.top_k]
     w = pd.Series(0.0, index=signal_row.index)

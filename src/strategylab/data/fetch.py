@@ -5,6 +5,7 @@ that use NIFTY BANK read the same download:
     data/raw/nse_<index-slug>.parquet      NSE index OHLC
     data/raw/nsedy_<index-slug>.parquet    NSE dividend yield
     data/raw/etf_<TICKER>.parquet          Yahoo ETF prices
+    data/raw/amfi_<scheme>.parquet         AMFI mutual-fund NAV (via api.mfapi.in)
 
 NSE's historicalOR/indicesHistory API returns at most 70 rows per call, so
 requests go in 90-day windows and any window that hits the cap is split in two.
@@ -46,6 +47,25 @@ def nsedy_path(index: str):
 
 def etf_path(ticker: str):
     return RAW / f"etf_{ticker}.parquet"
+
+
+def amfi_path(scheme: int):
+    return RAW / f"amfi_{scheme}.parquet"
+
+
+def amfi_nav(scheme: int) -> pd.DataFrame:
+    for attempt in range(5):
+        try:
+            r = requests.get(f"https://api.mfapi.in/mf/{scheme}", timeout=60)
+            if r.status_code == 200:
+                rows = r.json()["data"]
+                df = pd.DataFrame({"date": pd.to_datetime([x["date"] for x in rows], format="%d-%m-%Y"),
+                                   "close": pd.to_numeric([x["nav"] for x in rows], errors="coerce")})
+                return df.dropna()
+        except (requests.RequestException, ValueError, KeyError):
+            pass
+        time.sleep(2 * (attempt + 1))
+    raise RuntimeError(f"AMFI NAV download failed for scheme {scheme}")
 
 
 class NSEClient:
@@ -114,9 +134,9 @@ def _finalize(df: pd.DataFrame) -> pd.DataFrame:
     return df.sort_values("date").drop_duplicates("date", keep="last").reset_index(drop=True)
 
 
-def requirements(strategy_ids: list[str]) -> tuple[dict[str, tuple[date, bool]], dict[str, date]]:
-    """Union of instruments needed: NSE index -> (start, needs dividend yield); ETF ticker -> start."""
-    nse, etfs = {}, {}
+def requirements(strategy_ids: list[str]) -> tuple[dict[str, tuple[date, bool]], dict[str, date], set[int]]:
+    """Union of instruments needed: NSE index -> (start, needs dividend yield); ETF ticker -> start; AMFI schemes."""
+    nse, etfs, amfi = {}, {}, set()
     for sid in strategy_ids:
         cfg = load_config(sid)
         start = date.fromisoformat(cfg["periods"]["data_start"])
@@ -127,13 +147,15 @@ def requirements(strategy_ids: list[str]) -> tuple[dict[str, tuple[date, bool]],
                 nse[a["index"]] = (min(prev[0], start), prev[1] or a["source"] == "nse")
             if a.get("etf"):
                 etfs[a["etf"]] = min(etfs.get(a["etf"], start), start)
-    return nse, etfs
+            if a.get("source") == "amfi":
+                amfi.add(int(a["scheme"]))
+    return nse, etfs, amfi
 
 
 def fetch(strategy_ids: list[str] | None = None, refresh: bool = False, end: date | None = None) -> None:
     RAW.mkdir(parents=True, exist_ok=True)
     end = end or date.today()
-    nse, etfs = requirements(strategy_ids or list_strategies())
+    nse, etfs, amfi = requirements(strategy_ids or list_strategies())
     client = None
     for index, (start, needs_dy) in sorted(nse.items()):
         jobs = [("index", nse_path(index))] + ([("dy", nsedy_path(index))] if needs_dy else [])
@@ -145,6 +167,11 @@ def fetch(strategy_ids: list[str] | None = None, refresh: bool = False, end: dat
             df = (client.index_history(index, start, end) if kind == "index"
                   else client.dividend_yield(index, max(start, DY_START), end))
             _finalize(df).to_parquet(path)
+
+    for scheme in sorted(amfi):
+        if refresh or not amfi_path(scheme).exists():
+            print(f"[amfi] scheme {scheme}", flush=True)
+            _finalize(amfi_nav(scheme)).to_parquet(amfi_path(scheme))
 
     todo = [t for t in etfs if refresh or not etf_path(t).exists()]
     if todo:

@@ -55,7 +55,7 @@ def series_frame(nav: pd.DataFrame, after_tax: bool) -> pd.DataFrame:
             MARKET: "market_after_tax", REFERENCE: "reference_price"}
     if "walkforward_net" in nav and not after_tax:
         cols["Walk-forward"] = "walkforward_net"
-    df = pd.DataFrame({k: nav[v] for k, v in cols.items() if v in nav}).dropna(how="all")
+    df = pd.DataFrame({k: nav[v] for k, v in cols.items() if v in nav}).dropna(how="all").dropna(axis=1, how="all")
     return df / df.bfill().iloc[0]
 
 
@@ -121,7 +121,8 @@ if choice == "Compare all":
         ss = d["stats"]
         p = ss["perf"]
         rows.append({
-            "strategy": sid, "model": ss.get("model"), "primary": ss["primary"],
+            "strategy": sid, "model": ss.get("model"), "gates": ss.get("gate_type", "relative_return"),
+            "primary": ss["primary"],
             "status": "rejected" if ss["killed"] else "alive",
             "gates passed": f"{sum(g['pass'] for g in ss['gates'])}/{len(ss['gates'])}",
             "CAGR net": pct(p["primary_net"]["CAGR"]), "CAGR after tax": pct(p["primary_after_tax"].get("CAGR_after_tax")),
@@ -147,6 +148,10 @@ if choice == "Compare all":
             fig = px.imshow(corr, zmin=-1, zmax=1, color_continuous_scale=DIVERGING, text_auto=".2f",
                             title="Correlation of monthly returns")
             st.plotly_chart(fig, width="stretch")
+    ledger = strategy_dir(strategies[0]).parent / "LEDGER.md"
+    if ledger.exists():
+        with st.expander("Strategy ledger (selection across strategies)", expanded=True):
+            st.markdown(ledger.read_text())
     st.info("Add a strategy: create strategies/<id>/ with config.yaml and HYPOTHESIS.md, commit the "
             "pre-registration, then `uv run lab fetch` and `uv run lab research --strategy <id>`.")
     st.stop()
@@ -187,7 +192,7 @@ nav_all = data["nav"]
 rf = nav_all["rf"]
 frame = series_frame(nav_all, after_tax)
 
-tabs = st.tabs(["Overview", "Performance", "Holdings & trading", "Costs & tax", "Signal (IC)",
+tabs = st.tabs(["Overview", "Performance", "Holdings & trading", "Costs & tax", "Signal",
                 "Robustness & overfitting", "Next rebalance", "Data quality", "Assumptions"])
 
 # ----- Overview -----------------------------------------------------------------------------
@@ -202,7 +207,8 @@ with tabs[0]:
     if hold:
         hs = hold["stats"]
         st.markdown(f"**Holdout (used once, {hs['start']} → {hs['end']})**: "
-                    f"{GOOD if hs['pass'] else BAD} — after-tax active CAGR {pct(hs['after_tax_active_cagr'], 2)}")
+                    f"{GOOD if hs['pass'] else BAD} — rule: {hs.get('pass_rule', 'after-tax CAGR above EW')}; "
+                    f"after-tax CAGR vs EW {pct(hs['after_tax_active_cagr'], 2)}")
     else:
         st.info("Holdout not yet used. When every development gate has been reviewed, run "
                 f"`uv run lab holdout --strategy {SID} --i-have-not-changed-anything` (one time only).",
@@ -219,18 +225,18 @@ with tabs[0]:
     act = nav.resample("ME").last().pct_change() - ew.resample("ME").last().pct_change()
     k = st.columns(6)
     k[0].metric("CAGR", pct(cagr), delta=f"{(cagr - ew_cagr) * 100:+.1f} pp vs EW")
-    k[1].metric("Sharpe (excess of 1D rate)", num(ex.mean() / ex.std() * np.sqrt(252)))
+    k[1].metric("Sharpe (excess of cash)", num(ex.mean() / ex.std() * np.sqrt(252)))
     k[2].metric("Max drawdown", pct((nav / nav.cummax() - 1).min()))
     k[3].metric("Active IR vs EW", num(act.mean() / act.std() * np.sqrt(12)))
     if period == "Development":
-        k[4].metric("Deflated Sharpe", num(s["dsr"]["dsr"], 3), help="Probability the active Sharpe is real after "
-                    f"{s['n_trials']} trials; needs > 0.95")
+        k[4].metric("Deflated Sharpe", num(s["dsr"]["dsr"], 3), help=f"Probability the Sharpe of the "
+                    f"{s['selection_label']} series is real after {s['n_trials']} trials; needs > 0.95")
         k[5].metric("PBO", num(s["pbo"]["pbo"]), help="Probability of backtest overfitting (CSCV); needs < 0.50")
     else:
         k[4].metric("Months", len(act.dropna()))
         k[5].metric("Hit rate vs EW", pct((act.dropna() > 0).mean(), 0))
     st.plotly_chart(line_chart(frame, "Growth of ₹1", log=log_scale), width="stretch")
-    if s.get("suspicious_ic"):
+    if s.get("suspicious_signal"):
         st.warning("Mean IC above 0.15 — treat as a probable bug or lookahead.")
 
 # ----- Performance ----------------------------------------------------------------------------
@@ -379,61 +385,73 @@ with tabs[3]:
 
 # ----- Signal ---------------------------------------------------------------------------------------
 with tabs[4]:
-    ic = dev["ic_table"]
-    st.subheader("Cross-sectional rank IC (development period)")
-    st.dataframe(ic.style.format({c: "{:.3f}" for c in ic.columns if c not in ("signal", "n")}),
+    sig = dev["signal_table"]
+    xs = s["signal_test"] == "cross_sectional"
+    st.subheader(("Cross-sectional rank IC" if xs else "Time-series test: on-minus-off spread") + " (development period)")
+    st.dataframe(sig.style.format({c: "{:.4f}" for c in sig.columns if c not in ("signal", "n")}),
                  width="stretch", hide_index=True)
-    st.caption("Gate: primary signal Newey-West t > 2 and the same sign in both halves. "
-               "Typical cross-sectional ICs are 0.02–0.05; above 0.10 suspect lookahead.")
-    ics = dev["ic_series"]["ic"]
+    st.caption("Gate: primary signal Newey-West t > 2 and the same sign in both halves. " + (
+        "Typical cross-sectional ICs are 0.02–0.05; above 0.10 suspect lookahead." if xs else
+        "Spread = mean forward excess-over-cash return of assets whose trend is on minus those whose trend is off, "
+        "per decision. on_excess_m / off_excess_m are the two sides; IC_xs is the cross-sectional rank IC."))
+    ser = dev["signal_series"]["value"]
     fig = go.Figure()
-    fig.add_trace(go.Bar(x=ics.index, y=ics, name="monthly IC", marker_color="#86b6ef"))
-    fig.add_trace(go.Scatter(x=ics.index, y=ics.rolling(roll_win).mean(), name=f"{roll_win}-month mean",
+    fig.add_trace(go.Bar(x=ser.index, y=ser, name=s["signal_label"], marker_color="#86b6ef"))
+    fig.add_trace(go.Scatter(x=ser.index, y=ser.rolling(roll_win, min_periods=6).mean(), name=f"{roll_win}-decision mean",
                              line=dict(color=COLORS["Strategy"], width=2)))
-    fig.update_layout(title=f"Primary signal rank IC ({s['primary'].rsplit('_top', 1)[0]})", height=360,
-                      hovermode="x unified", legend=dict(orientation="h", y=1.02, x=1, xanchor="right", yanchor="bottom"))
+    fig.update_layout(title=f"Primary signal: {s['signal_label']}", height=360, hovermode="x unified",
+                      legend=dict(orientation="h", y=1.02, x=1, xanchor="right", yanchor="bottom"))
+    if not xs:
+        fig.update_yaxes(tickformat=".1%")
     st.plotly_chart(fig, width="stretch")
     c1, c2 = st.columns(2)
-    dec = ic.set_index("signal")[["IC_1m", "IC_3m", "IC_6m", "IC_12m"]]
-    dl = dec.reset_index().melt("signal", var_name="Horizon", value_name="Mean IC")
-    fig = px.line(dl, x="Horizon", y="Mean IC", color="signal", markers=True, title="IC decay by forward horizon")
+    dcols = [c for c in sig.columns if c.startswith(("IC_", "spread_")) and c[-1] == "m" and c != "IC_xs"]
+    dl = sig.set_index("signal")[dcols].reset_index().melt("signal", var_name="Horizon", value_name="Mean")
+    fig = px.line(dl, x="Horizon", y="Mean", color="signal", markers=True, title="Decay by forward horizon")
     fig.update_layout(height=360, legend_title=None)
     c1.plotly_chart(fig, width="stretch")
-    by_year = ics.groupby(ics.index.year).mean()
-    fig = px.bar(by_year, title="Mean IC by year", color=by_year.values > 0,
+    by_year = ser.groupby(ser.index.year).mean()
+    fig = px.bar(by_year, title="Mean by year", color=by_year.values > 0,
                  color_discrete_map={True: "#2a78d6", False: "#d03b3b"})
     fig.update_layout(showlegend=False, height=360, yaxis_title=None, xaxis_title=None)
     c2.plotly_chart(fig, width="stretch")
 
 # ----- Robustness ------------------------------------------------------------------------------------
 with tabs[5]:
-    st.subheader("Selection-adjusted statistics")
+    st.subheader(f"Selection-adjusted statistics ({s['selection_label']}, monthly)")
     d, pb = s["dsr"], s["pbo"]
-    k = st.columns(5)
+    k = st.columns(6)
     k[0].metric("Deflated Sharpe (primary)", num(d["dsr"], 3), help="> 0.95 required")
     k[1].metric("PBO", num(pb["pbo"]), help="< 0.50 required")
-    k[2].metric("Haircut best active IR", f"{s['haircut']:+.2f}", help="Best annualised active IR minus the "
+    k[2].metric("Haircut, best Sharpe", f"{s['haircut']:+.2f}", help="Best annualised Sharpe in the grid minus the "
                 "expected maximum under the null; negative means no evidence of skill")
-    k[3].metric("Bootstrap p (active > 0)", num(s["bootstrap_p"], 3))
-    k[4].metric("Robustness (share of grid with active IR > 0)", pct(s["robustness"], 0), help="Target > 60%")
-    st.caption(f"Per-month active Sharpe {d['sr']:.3f} vs expected maximum under the null {d['e_max_sr']:.3f} "
+    k[3].metric("Bootstrap p (mean > 0)", num(s["bootstrap_p"], 3))
+    k[4].metric("Sharpe > EW, bootstrap p", num(s.get("sharpe_diff_p"), 3),
+                help="Paired block bootstrap on excess-over-cash returns; one-sided")
+    k[5].metric("Robustness", pct(s["robustness"], 0),
+                help=("Share of the grid with positive active IR" if s["gate_type"] == "relative_return"
+                      else "Share of the grid passing the strategy-gate rule") + "; target > 60%")
+    st.caption(f"Per-month Sharpe {d['sr']:.3f} vs expected maximum under the null {d['e_max_sr']:.3f} "
                f"across {s['n_trials']} trials; skew {d['skew']:.2f}, kurtosis {d['kurtosis']:.2f}, n = {d['n']}. "
                f"PBO from {pb['n_splits']} CSCV splits; in-sample-best per-month SR {pb['is_sr_best_mean']:.3f} → "
                f"out-of-sample {pb['oos_sr_best_mean']:.3f}.")
 
     trials = dev["trials"].copy()
-    trials["score"] = trials["trial"].str.split("_").str[0]
-    trials["lookback"] = trials["trial"].str.extract(r"_(\d+(?:-\d+)?)_top")[0]
-    trials["top_k"] = trials["trial"].str.extract(r"top(\d+)")[0].astype(int)
-    metric = st.selectbox("Heatmap metric", ["active_IR", "active_ann", "Sharpe_net", "CAGR_after_tax", "MaxDD"])
-    cols = st.columns(trials["score"].nunique())
+    fields = s["spec_fields"]
+    facet, colf = fields[0], fields[-1]
+    mids = fields[1:-1] or [fields[0]]
+    trials["_row"] = trials[mids].astype(str).agg("/".join, axis=1)
+    metric = st.selectbox("Heatmap metric", ["sel_SR", "active_IR", "Sharpe_net", "MaxDD", "Calmar",
+                                             "CAGR_net", "CAGR_after_tax", "active_ann"])
+    groups = list(trials.groupby(facet))
+    cols = st.columns(len(groups))
     vals = trials[metric]
     lim = float(np.nanmax(np.abs(vals))) or 1
-    for col, (score, sub) in zip(cols, trials.groupby("score")):
-        hm = sub.pivot(index="lookback", columns="top_k", values=metric)
+    for col, (fv, sub) in zip(cols, groups):
+        hm = sub.pivot(index="_row", columns=colf, values=metric)
         fig = px.imshow(hm, color_continuous_scale=DIVERGING, zmin=-lim, zmax=lim,
-                        text_auto=".2f" if metric in ("active_IR", "Sharpe_net") else ".1%",
-                        title=f"score = {score}", aspect="auto")
+                        text_auto=".2f" if metric in ("sel_SR", "active_IR", "Sharpe_net", "Calmar") else ".1%",
+                        title=f"{facet} = {fv}", aspect="auto", labels=dict(y="/".join(mids), x=colf))
         fig.update_layout(height=330, coloraxis_showscale=False)
         col.plotly_chart(fig, width="stretch")
     st.caption("Every cell is a trial. A primary spec surrounded by much weaker neighbours (a cliff) "
@@ -451,28 +469,29 @@ with tabs[5]:
                              line=dict(width=2, color=COLORS["EW"])))
     fig.add_trace(go.Scatter(x=tn.index, y=tn[s["primary"]], mode="lines", name=f"Primary ({s['primary']})",
                              line=dict(width=2.5, color=COLORS["Strategy"])))
-    fig.update_layout(title="All 24 trials (grey) vs primary and EW, net of costs", height=420)
+    fig.update_layout(title=f"All {s['n_trials']} trials (grey) vs primary and EW, net of costs", height=420)
     fig.update_yaxes(type="log" if log_scale else "linear")
     st.plotly_chart(fig, width="stretch")
 
-    show = trials.drop(columns=["score", "lookback", "top_k"]).sort_values("active_IR", ascending=False)
-    st.dataframe(show.style.format({"CAGR_net": "{:.1%}", "MaxDD": "{:.1%}", "CAGR_after_tax": "{:.1%}",
-                                    "active_ann": "{:.2%}", "Sharpe_net": "{:.2f}", "Calmar": "{:.2f}",
-                                    "active_IR": "{:.2f}", "turnover_pa": "{:.2f}"}),
+    show = trials.drop(columns=fields + ["_row"]).sort_values("sel_SR", ascending=False)
+    st.dataframe(show.style.format({"CAGR_net": "{:.1%}", "MaxDD": "{:.1%}", "MaxDD_after_tax": "{:.1%}",
+                                    "CAGR_after_tax": "{:.1%}", "active_ann": "{:.2%}", "Sharpe_net": "{:.2f}",
+                                    "Calmar": "{:.2f}", "active_IR": "{:.2f}", "sel_SR": "{:.2f}",
+                                    "turnover_pa": "{:.2f}"}),
                  width="stretch", hide_index=True)
 
-    st.subheader("Walk-forward selection (trial 25)")
+    st.subheader(f"Walk-forward selection (trial {s['n_trials'] + 1})")
     wf = s["walk_forward"]
     k = st.columns(3)
-    k[0].metric("Expanding: active p.a. / IR", f"{pct(wf['expanding']['active_ann'], 2)} / {num(wf['expanding']['active_IR'])}")
-    k[1].metric("Rolling 5y: active p.a. / IR", f"{pct(wf['rolling']['active_ann'], 2)} / {num(wf['rolling']['active_IR'])}")
-    k[2].metric("Primary, same window", f"{pct(s['primary_same_window']['active_ann'], 2)} / "
-                                        f"{num(s['primary_same_window']['active_IR'])}")
+    k[0].metric("Expanding: mean p.a. / Sharpe", f"{pct(wf['expanding']['ann'], 2)} / {num(wf['expanding']['SR'])}")
+    k[1].metric("Rolling 5y: mean p.a. / Sharpe", f"{pct(wf['rolling']['ann'], 2)} / {num(wf['rolling']['SR'])}")
+    k[2].metric("Primary, same window", f"{pct(s['primary_same_window']['ann'], 2)} / "
+                                        f"{num(s['primary_same_window']['SR'])}")
     wfs = dev["walk_forward"].copy()
-    am = dev["active_monthly"][s["primary"]].reindex(wfs.index)
+    am = dev["selection_monthly"][s["primary"]].reindex(wfs.index)
     cum = pd.DataFrame({"Walk-forward (expanding)": (1 + wfs["expanding"]).cumprod(),
                         "Walk-forward (rolling)": (1 + wfs["rolling"]).cumprod(), "Primary": (1 + am).cumprod()})
-    fig = line_chart(cum, "Cumulative active return vs EW", height=340)
+    fig = line_chart(cum, f"Cumulative {s['selection_label']} return", height=340)
     fig.update_traces(selector=dict(name="Primary"), line_color=COLORS["Strategy"])
     fig.update_traces(selector=dict(name="Walk-forward (expanding)"), line_color=COLORS["Walk-forward"])
     fig.update_traces(selector=dict(name="Walk-forward (rolling)"), line_color="#6250d6")

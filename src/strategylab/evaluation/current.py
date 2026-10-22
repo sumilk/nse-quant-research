@@ -23,9 +23,9 @@ def main(strategy_id: str) -> None:
     spec = model.primary(cfg)
     lv, rt = panel.levels, panel.returns
     asof = lv.index[-1]
-    sc = model.signal(lv, rt, spec).loc[asof]
+    sc = model.signal(lv, rt, spec, cfg).loc[asof]
     el = eligibility(lv, rt, cfg["universe"]["min_history_sessions"]).loc[asof]
-    w = model.weights(sc, el, spec)
+    w = model.weights(sc, el, spec, cfg)
     etf = {a["id"]: a.get("etf") for a in cfg["universe"]["assets"]}
     vol = rt.rolling(63).std().loc[asof] * (252 ** 0.5)
     rows = pd.DataFrame({"asset": sc.index, "etf": [etf[a] for a in sc.index], "score": sc.values,

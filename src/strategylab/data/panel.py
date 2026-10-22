@@ -18,7 +18,7 @@ import numpy as np
 import pandas as pd
 
 from strategylab.config import ROOT
-from strategylab.data.fetch import etf_path, nse_path, nsedy_path
+from strategylab.data.fetch import amfi_path, etf_path, nse_path, nsedy_path
 
 SESSIONS_PER_YEAR = 252
 MAX_FFILL_SESSIONS = 2
@@ -40,6 +40,22 @@ def _drop_spikes(px: pd.DataFrame, window: int = 11, factor: float = 3.0) -> tup
     ratio = px["close"] / med
     bad = (ratio > factor) | (ratio < 1 / factor)
     return px[~bad], list(px.index[bad])
+
+
+def _adjust_rebases(px: pd.DataFrame, factor: float = 3.0) -> tuple[pd.DataFrame, list]:
+    """Undo persistent level jumps (unit splits, face-value changes) by rescaling earlier history.
+
+    Run after _drop_spikes: a jump that is still there is permanent, e.g. the HDFC
+    Liquid Fund NAV moving from 28.52 to 2852.85 on 2015-08-30. Returns the
+    adjusted frame and (date, ratio) for each adjustment.
+    """
+    px = px.copy()
+    ratio = px["close"] / px["close"].shift(1)
+    events = [(d, float(r)) for d, r in ratio[(ratio > factor) | (ratio < 1 / factor)].items()]
+    price_cols = [c for c in ("open", "high", "low", "close", "adj_close") if c in px]
+    for d, r in events:
+        px.loc[px.index < d, price_cols] *= r
+    return px, events
 
 
 def _load(path, schema: dict) -> pd.DataFrame:
@@ -64,7 +80,8 @@ class Panel:
     dy_fallback: dict[str, tuple[pd.Timestamp | None, float]]
     ffilled: dict[str, int]
     etf: dict[str, pd.DataFrame]   # ETF ticker -> prices (spikes removed)
-    etf_spikes: dict[str, list]    # ETF ticker -> dates of removed prints
+    etf_spikes: dict[str, list]    # source series -> dates of removed one-off prints
+    rebases: dict[str, list]       # source series -> (date, ratio) of persistent jumps undone
     etf_adv_cr: pd.Series          # asset id -> median daily traded value of its ETF, last year, Rs crore
     reference: dict[str, pd.Series]  # reference benchmarks (price series, no costs or tax)
 
@@ -76,10 +93,11 @@ def build_panel(cfg: dict) -> Panel:
     cal = pd.DatetimeIndex(master["date"]).sort_values()
     cal = cal[cal >= pd.Timestamp(cfg["periods"]["data_start"])]
 
-    etf, etf_spikes = {}, {}
+    etf, etf_spikes, rebases = {}, {}, {}
     for a in uni["assets"]:
         if a.get("etf"):
-            etf[a["etf"]], etf_spikes[a["etf"]] = _drop_spikes(_load(etf_path(a["etf"]), ETF_SCHEMA).set_index("date"))
+            e, etf_spikes[a["etf"]] = _drop_spikes(_load(etf_path(a["etf"]), ETF_SCHEMA).set_index("date"))
+            etf[a["etf"]], rebases[a["etf"]] = _adjust_rebases(e)
     rets, ohlc, dy_fallback, ffilled = {}, {}, {}, {}
 
     for a in uni["assets"]:
@@ -90,6 +108,12 @@ def build_panel(cfg: dict) -> Panel:
             close = px["close"]
         elif a["source"] == "yahoo":
             close = etf[a["etf"]]["adj_close"]
+        elif a["source"] == "amfi":
+            key = f"AMFI {a['scheme']}"
+            nav, etf_spikes[key] = _drop_spikes(_load(amfi_path(int(a["scheme"])),
+                                                      {"date": "datetime64[ns]", "close": "float64"}).set_index("date"))
+            nav, rebases[key] = _adjust_rebases(nav)
+            close = nav["close"]
         else:
             raise ValueError(f"{aid}: unknown source {a['source']}")
 
@@ -141,4 +165,5 @@ def build_panel(cfg: dict) -> Panel:
         if isinstance(b, dict):
             reference[name] = _load(nse_path(b["index"]), INDEX_SCHEMA).set_index("date")["close"].reindex(cal)
 
-    return Panel(cal, returns, levels, rf, ohlc, dy_fallback, ffilled, etf, etf_spikes, pd.Series(adv), reference)
+    return Panel(cal, returns, levels, rf, ohlc, dy_fallback, ffilled, etf, etf_spikes, rebases, pd.Series(adv),
+                 reference)

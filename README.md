@@ -20,6 +20,9 @@ Every strategy goes through the same steps:
 | Strategy | Model | Idea | Development result |
 |---|---|---|---|
 | [`india_etf_momentum`](strategies/india_etf_momentum/) | `xsec_momentum` | Monthly top-4 rotation across 18 NSE index ETFs (sectors, sizes, gold, silver, G-Sec, cash) by 6-month return | **Rejected.** IC t 1.43, Deflated Sharpe 0.08, trails equal weight after costs and tax ([report](strategies/india_etf_momentum/results/REPORT_dev.md)) |
+| [`india_etf_trend`](strategies/india_etf_trend/) | `ts_trend` | Hold each of 16 risky index ETFs only while its 12-month return beats cash; otherwise cash | **Rejected.** Max drawdown −31% vs −61% for equal weight, but signal t 0.37, Sharpe 0.41 vs 0.48, PBO 0.74, 3.9 pp a year behind after tax ([report](strategies/india_etf_trend/results/REPORT_dev.md)) |
+
+Every strategy tested, and what it was chosen after, is in the [strategy ledger](strategies/LEDGER.md).
 
 ## Layout
 
@@ -36,7 +39,8 @@ src/strategylab/
              backtest.py    daily loop: next-session fills, FIFO lots, cash, tax
              costs.py       Indian delivery charges, spread, square-root impact
              tax.py         STCG/LTCG, set-off, carry-forward
-  models/    xsec_momentum.py   signal + weights; register new models in models/__init__.py
+  models/    xsec_momentum.py   cross-sectional momentum (rank, top k)
+             ts_trend.py        time-series trend (each asset vs cash, off -> defensive asset)
   evaluation/ research.py   development gates, 24-trial grid, report
               holdout.py    one-shot holdout
               current.py    ranking on the latest close
@@ -86,6 +90,7 @@ uv run lab holdout --strategy india_etf_momentum --i-have-not-changed-anything
 | Index prices | NSE `historicalOR/indicesHistory` | Price indices only |
 | Dividend yields | NSE `indicesYield` | Published from 2015/16 |
 | ETF prices | Yahoo Finance | Isolated bad prints (e.g. around the Dec-2019 unit splits) are removed and reported |
+| Mutual-fund NAV | AMFI via api.mfapi.in | Used as cash proxy before ETFs existed; persistent jumps (e.g. a 2015 x100 face-value change) are undone and reported |
 
 NSE does not publish total-return series through this API. Total return is
 approximated as price return plus a daily dividend accrual from the published

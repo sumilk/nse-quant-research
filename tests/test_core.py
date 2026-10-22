@@ -112,7 +112,7 @@ def test_cash_never_negative_with_costs_and_tax():
     cfg = _cfg(lv.columns)
     cm = CostModel(COST_CFG, {a: 2e7 for a in lv.columns}, {a: "equity" for a in lv.columns})
     elig = eligibility(lv, r, 252)
-    wf = model_weights(xm, xm.Spec("ret", 126, 0, 2), lv, r, elig)
+    wf = model_weights(xm, xm.Spec("ret", 126, 0, 2), lv, r, elig, cfg)
     res = run("rk", lv, r, cfg, cm, weights_fn=wf, start=lv.index[260], end=lv.index[-1])
     assert (res.nav > 0).all()
     assert res.costs.sum() > 0
@@ -129,3 +129,51 @@ def test_every_strategy_config_is_consistent():
         assert (strategy_dir(sid) / "HYPOTHESIS.md").exists(), f"{sid}: no pre-registration"
         ids = {a["id"] for a in cfg["universe"]["assets"]}
         assert cfg["universe"]["calendar_master"] in ids
+
+
+def _trend_cfg(assets):
+    cfg = _cfg(assets)
+    for a in cfg["universe"]["assets"]:
+        a["role"] = "defensive" if a["id"] in ("CASH", "BOND") else "risky"
+    cfg["universe"]["cash_asset"] = "CASH"
+    return cfg
+
+
+def test_trend_signal_ignores_future_and_defensive_assets():
+    from strategylab.models import ts_trend as tt
+    lv, r = _panel(assets=("A", "B", "C", "CASH", "BOND"))
+    cfg = _trend_cfg(lv.columns)
+    for rule in ("excess", "sma"):
+        spec = tt.Spec(rule, 126, "CASH")
+        d = lv.index[500]
+        base = tt.signal(lv, r, spec, cfg)
+        assert base[["CASH", "BOND"]].isna().all().all()
+        lv2 = lv.copy()
+        lv2.iloc[501:] *= 2
+        assert tt.signal(lv2, r, spec, cfg).loc[d].equals(base.loc[d])
+
+
+def test_trend_weights_route_off_assets_to_defensive():
+    from strategylab.models import ts_trend as tt
+    cols = pd.Index(["A", "B", "C", "D", "CASH", "BOND"])
+    cfg = _trend_cfg(cols)
+    sig = pd.Series({"A": 0.1, "B": -0.2, "C": 0.05, "D": np.nan, "CASH": np.nan, "BOND": np.nan})
+    elig = pd.Series(True, index=cols)
+    w = tt.weights(sig, elig, tt.Spec("excess", 252, "BOND"), cfg)
+    assert w["A"] == pytest.approx(1 / 3) and w["C"] == pytest.approx(1 / 3)
+    assert w["B"] == 0 and w["D"] == 0 and w["CASH"] == 0
+    assert w["BOND"] == pytest.approx(1 / 3)
+    assert w.sum() == pytest.approx(1.0)
+
+
+def test_rebase_is_undone_and_spike_is_removed():
+    from strategylab.data.panel import _adjust_rebases, _drop_spikes
+    idx = pd.bdate_range("2020-01-01", periods=40)
+    close = pd.Series(np.linspace(10, 11, 40), index=idx)
+    close.iloc[20:] *= 100          # permanent x100 face-value change
+    close.iloc[10] /= 10            # one-off bad print
+    px, spikes = _drop_spikes(pd.DataFrame({"close": close}))
+    px, events = _adjust_rebases(px)
+    assert spikes == [idx[10]]
+    assert len(events) == 1 and events[0][1] == pytest.approx(100, rel=0.01)
+    assert px["close"].pct_change().abs().max() < 0.01
