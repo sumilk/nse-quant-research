@@ -1,0 +1,107 @@
+# Single source of truth for this strategy. Pre-registered in HYPOTHESIS.md.
+strategy_id: india_etf_trend
+setup_version: v1
+# Signal and portfolio logic: src/strategylab/models/<model>.py
+model: ts_trend
+
+periods:
+  data_start: "2005-01-01"
+  dev_end: "2024-09-30"
+  holdout_start: "2024-10-01"
+
+# role: risky assets are trend-tested; defensive assets receive the weight of risky assets that are off.
+# source: nse = NSE price index + dividend yield; nse_tr = NSE total-return index;
+#         yahoo = ETF price; amfi = mutual-fund NAV (growth option, net of fees).
+universe:
+  calendar_master: NIFTY50
+  cash_asset: CASH
+  min_history_sessions: 252
+  assets:
+    - {id: NIFTY50,     role: risky, source: nse,   index: "NIFTY 50",           etf: NIFTYBEES,  tax_class: equity}
+    - {id: NEXT50,      role: risky, source: nse,   index: "NIFTY NEXT 50",      etf: JUNIORBEES, tax_class: equity}
+    - {id: MIDCAP150,   role: risky, source: nse,   index: "NIFTY MIDCAP 150",   etf: MID150BEES, tax_class: equity}
+    - {id: SMALLCAP250, role: risky, source: nse,   index: "NIFTY SMALLCAP 250", etf: HDFCSML250, tax_class: equity}
+    - {id: BANK,        role: risky, source: nse,   index: "NIFTY BANK",         etf: BANKBEES,   tax_class: equity}
+    - {id: IT,          role: risky, source: nse,   index: "NIFTY IT",           etf: ITBEES,     tax_class: equity}
+    - {id: PHARMA,      role: risky, source: nse,   index: "NIFTY PHARMA",       etf: PHARMABEES, tax_class: equity}
+    - {id: FMCG,        role: risky, source: nse,   index: "NIFTY FMCG",         etf: FMCGIETF,   tax_class: equity}
+    - {id: AUTO,        role: risky, source: nse,   index: "NIFTY AUTO",         etf: AUTOBEES,   tax_class: equity}
+    - {id: METAL,       role: risky, source: nse,   index: "NIFTY METAL",        etf: METALIETF,  tax_class: equity}
+    - {id: OILGAS,      role: risky, source: nse,   index: "NIFTY OIL & GAS",    etf: OILIETF,    tax_class: equity}
+    - {id: REALTY,      role: risky, source: nse,   index: "NIFTY REALTY",       etf: MOREALTY,   tax_class: equity}
+    - {id: PSUBANK,     role: risky, source: nse,   index: "NIFTY PSU BANK",     etf: PSUBNKBEES, tax_class: equity}
+    - {id: CPSE,        role: risky, source: nse,   index: "NIFTY CPSE",         etf: CPSEETF,    tax_class: equity}
+    - {id: GOLD,        role: risky, source: yahoo, index: null,                 etf: GOLDBEES,   tax_class: gold_silver}
+    - {id: SILVER,      role: risky, source: yahoo, index: null,                 etf: SILVERBEES, tax_class: gold_silver}
+    - {id: GSEC10Y,     role: defensive, source: nse_tr, index: "NIFTY 10 YR BENCHMARK G-SEC", etf: LTGILTBEES, tax_class: debt}
+    - {id: CASH,        role: defensive, source: amfi, scheme: 100868, etf: LIQUIDBEES, tax_class: debt}
+
+# A string is an asset id held buy-and-hold (with costs and tax).
+benchmarks:
+  nifty50: NIFTY50
+
+# Explained extreme moves and documented waivers (same evidence as india_etf_momentum).
+data_notes:
+  explained_moves:
+    - {asset: REALTY,  date: 2008-10-24, reason: "Global financial crisis sell-off (NIFTY -6% that day)"}
+    - {asset: REALTY,  date: 2009-05-18, reason: "General-election result rally; market hit upper circuit"}
+    - {asset: PSUBANK, date: 2017-10-25, reason: "Rs 2.11 lakh crore PSU bank recapitalisation announced 24-Oct-2017"}
+    - {asset: SILVER,  date: 2026-02-02, reason: "Global silver crash at end of Jan 2026 after a parabolic rally"}
+  waivers:
+    - {asset: GSEC10Y, check: ohlc, reason: "Close is the end-of-day valuation, high/low are traded prices; median gap 0.05%"}
+    - {asset: GSEC10Y, check: tracking, reason: "LTGILTBEES tracks NIFTY 8-13 yr G-Sec, not the 10 yr benchmark index; weekly corr 0.73"}
+
+decision:
+  cadence: monthly_last_session
+  execution_lag_sessions: 1
+
+primary:
+  rule: excess
+  lookback: 252
+  defensive: CASH
+
+grid:
+  rule: [excess, sma]
+  lookback: [126, 252]
+  defensive: [CASH, GSEC10Y]
+
+portfolio:
+  initial_capital_inr: 1000000
+
+costs:
+  brokerage_inr_per_order: 0.0
+  stt_sell_pct: 0.001
+  exchange_txn_pct: 0.00297
+  sebi_fee_pct: 0.0001
+  stamp_duty_buy_pct: 0.015
+  gst_pct: 18.0
+  dp_charge_inr_per_sell: 16.0
+  half_spread_tiers: [[100, 2], [20, 5], [5, 10], [0, 20]]
+  impact_coefficient: 0.1
+  max_participation: 0.05
+
+tax:
+  apply_current_rules_to_all_history: true
+  cess_pct: 4.0
+  slab_rate_pct: 30.0
+  equity: {st_rate: 20.0, lt_rate: 12.5, lt_months: 12, lt_exemption_inr: 125000}
+  gold_silver: {st_rate: slab, lt_rate: 12.5, lt_months: 12, lt_exemption_inr: 0}
+  debt: {st_rate: slab, lt_rate: slab, lt_months: null, lt_exemption_inr: 0}
+
+evaluation:
+  # Benchmark for the gates: equal weight across risky assets only (trend filter off).
+  ew_universe: risky
+  # Series the selection statistics (DSR, PBO, walk-forward, haircut) are computed on.
+  selection_series: excess_vs_cash
+  signal_test: time_series
+  pbo_blocks: 16
+  bootstrap_draws: 5000
+  newey_west_lags: 3
+  cost_multipliers: [0, 1, 2, 3]
+  walk_forward_selection: {min_train_years: 5, refit: annual, metric: sharpe}
+
+gates:
+  type: risk_reduction
+  max_dd_ratio_vs_ew: 0.667
+  tax_cagr_tolerance_pp: 2.0
+  bootstrap_p_max: 0.10
