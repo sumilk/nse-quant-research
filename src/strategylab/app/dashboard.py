@@ -32,6 +32,10 @@ st.set_page_config(page_title="India Strategy Lab", page_icon="📈", layout="wi
 
 def load(strategy_id: str, stage: str) -> dict | None:
     """Artifacts for one strategy and stage; re-read whenever any artifact file changes."""
+    if stage == "dev":
+        status = results_dir(strategy_id) / "validation_status.json"
+        if status.exists() and json.loads(status.read_text()).get("state") != "valid":
+            return None
     d = results_dir(strategy_id) / "artifacts" / stage
     if not (d / "stats.json").exists():
         return None
@@ -75,7 +79,7 @@ def perf_table(df: pd.DataFrame, rf: pd.Series) -> pd.DataFrame:
         yrs = (nav.index[-1] - nav.index[0]).days / 365.25
         dd = nav / nav.cummax() - 1
         cagr = (nav.iloc[-1] / nav.iloc[0]) ** (1 / yrs) - 1
-        down = ex[ex < 0].std() * np.sqrt(252)
+        down = np.sqrt(np.mean(np.minimum(ex, 0.0) ** 2) * 252)
         var = np.percentile(r, 5)
         m = nav.resample("ME").last().pct_change().dropna()
         rows[c] = {"CAGR": pct(cagr), "Volatility": pct(r.std() * np.sqrt(252)),
@@ -113,6 +117,7 @@ def gate_badges(gates: list[dict]) -> None:
 strategies = list_strategies()
 with st.sidebar:
     st.header("India Strategy Lab")
+    st.caption("Index-proxy research. Previous holdout contamination is disclosed in reports.")
     choice = st.selectbox("Strategy", ["Compare all"] + strategies,
                           index=1 if len(strategies) == 1 else 0)
 
@@ -123,7 +128,10 @@ if choice == "Compare all":
         d = load(sid, "dev")
         h = load(sid, "holdout")
         if d is None:
-            rows.append({"strategy": sid, "status": "not researched"})
+            status_path = results_dir(sid) / "validation_status.json"
+            state = json.loads(status_path.read_text()) if status_path.exists() else {}
+            rows.append({"strategy": sid, "status": state.get("state", "not researched"),
+                         "reason": state.get("reason", "")})
             continue
         ss = d["stats"]
         p = ss["perf"]
@@ -173,7 +181,16 @@ if (cur_dir / "ranking.parquet").exists():
 
 st.title(SID.replace("_", " ").title())
 if dev is None:
-    st.warning(f"No results yet. Run `uv run lab research --strategy {SID}` first.")
+    status_path = results_dir(SID) / "validation_status.json"
+    if status_path.exists():
+        status = json.loads(status_path.read_text())
+        st.warning(f"Corrected evaluation {status['state']}: {status.get('reason', '')}")
+        report = results_dir(SID) / "data_validation.md"
+        if report.exists():
+            with st.expander("Data validation details"):
+                st.markdown(report.read_text())
+    else:
+        st.warning(f"No results yet. Run `uv run lab research --strategy {SID}` first.")
     st.stop()
 
 s = dev["stats"]

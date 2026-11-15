@@ -19,10 +19,22 @@ Every strategy goes through the same steps:
 
 | Strategy | Model | Idea | Development result |
 |---|---|---|---|
-| [`india_etf_momentum`](strategies/india_etf_momentum/) | `xsec_momentum` | Monthly top-4 rotation across 18 NSE index ETFs (sectors, sizes, gold, silver, G-Sec, cash) by 6-month return | **Rejected.** IC t 1.43, Deflated Sharpe 0.08, trails equal weight after costs and tax ([report](strategies/india_etf_momentum/results/REPORT_dev.md)) |
-| [`india_etf_trend`](strategies/india_etf_trend/) | `ts_trend` | Hold each of 16 risky index ETFs only while its 12-month return beats cash; otherwise cash | **Rejected.** Max drawdown −31% vs −61% for equal weight, but signal t 0.37, Sharpe 0.41 vs 0.48, PBO 0.74, 3.9 pp a year behind after tax ([report](strategies/india_etf_trend/results/REPORT_dev.md)) |
+| [`india_etf_momentum`](strategies/india_etf_momentum/) | `xsec_momentum` | Monthly top-4 index exposure rotation by 6-month return | **Reevaluation blocked by source-data gaps.** Previous metrics invalidated; [report](strategies/india_etf_momentum/results/REPORT_dev.md) |
+| [`india_etf_trend`](strategies/india_etf_trend/) | `ts_trend` | Hold each risky exposure while its 12-month return beats cash | **Reevaluation blocked by source-data gaps.** Previous metrics invalidated; [report](strategies/india_etf_trend/results/REPORT_dev.md) |
 
 Every strategy tested, and what it was chosen after, is in the [strategy ledger](strategies/LEDGER.md).
+
+See [research integrity corrections](docs/RESEARCH_INTEGRITY.md) for the fixes,
+regression checks, remaining data requirements and holdout contamination.
+
+## Research modes
+
+`lab research --strategy <id> --mode index_proxy` is a hypothetical index
+allocation experiment, including pre-ETF periods and explicitly assumed costs.
+`--mode etf` uses actual ETF adjusted-close histories and lagged trailing
+liquidity; it writes separate reports under `results/etf/`. It remains a
+fractional-unit simulation, not actual executed trades. Both modes reject
+unresolved source gaps and stale execution quotes.
 
 ## Layout
 
@@ -59,7 +71,7 @@ uv run lab fetch                                        # data for every strateg
 uv run lab research --strategy india_etf_momentum       # development period
 uv run lab current  --strategy india_etf_momentum       # ranking on the latest close
 uv run streamlit run src/strategylab/app/dashboard.py   # http://localhost:8501
-uv run pytest -q
+uv run python -m pytest -q
 ```
 
 Run the holdout only after reviewing every development gate, with nothing
@@ -98,17 +110,22 @@ yield.
 
 ## Limitations
 
+- **Current evaluation status:** source gaps block corrected development metrics.
+  The old reports are preserved in `results/legacy_review/` and hidden from the
+  dashboard. Holdout has not been run, but its prior use in costs and validation
+  means the window is not pristine.
+
 - **Back-calculated index history:** NSE back-calculates sector index history
   before each index's launch date.
-- **Liquidity known today:** universes are chosen by today's ETF liquidity, and
-  today's traded value is applied to all history for spreads, impact and
-  capacity.
+- **Universe selection:** the ETF universe was chosen with present-day knowledge.
+  ETF mode enforces observed history and trailing liquidity; index-proxy costs
+  use a declared fixed ADV scenario, not future ETF volumes.
 - **Today's tax rules on all history:** the rules in force after July 2024 are
   applied throughout. Tax is paid once a year rather than in advance-tax
   instalments.
-- **Index, not ETF:** strategies trade the index. ETF tracking difference
-  (expense ratio included) is reported in each data-validation report, not
-  deducted from returns.
+- **Index-proxy mode:** proxy returns omit ETF tracking differences and use
+  zero dividend accrual before yield publication. ETF mode uses vendor adjusted
+  ETF prices; cash-ETF distribution adjustments still need verification.
 
 ## Docker
 

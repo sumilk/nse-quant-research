@@ -10,7 +10,7 @@ wheels/
 .venv
 
 # Downloaded market data (re-fetch with the data stage)
-data/
+/data/
 
 # Third-party skills installed from ml4t/skills (not part of this project)
 .agents/

@@ -1,18 +1,5 @@
 {
-  "start": "2007-04-30",
-  "dev_end": "2024-09-30",
-  "gates": {
-    "Data": true,
-    "Signal": false,
-    "Strategy": false,
-    "Selection": false,
-    "Costs": false,
-    "Tax": false
-  },
-  "killed": true,
-  "dsr": 0.8868793760178992,
-  "pbo": 0.7406371406371406,
-  "signal": 0.0014774587101130628,
-  "signal_t": 0.3712855977318931,
-  "capacity_inr": 83318425.61437953
+  "status": "blocked",
+  "mode": "index_proxy",
+  "reason": "Data gate failed. Repair source gaps/inconsistencies; see data_validation.md."
 }

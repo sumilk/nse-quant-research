@@ -13,6 +13,7 @@ Never touches sessions after periods.dev_end. The holdout lives in holdout.py.
 from __future__ import annotations
 
 import json
+import shutil
 from dataclasses import asdict
 
 import matplotlib
@@ -27,7 +28,7 @@ from strategylab.data.panel import build_panel
 from strategylab.data.validate import validate
 from strategylab.engine.backtest import Result, buy_hold, equal_weight, model_weights, run
 from strategylab.engine.costs import CostModel
-from strategylab.engine.schedule import decision_schedule, eligibility
+from strategylab.engine.schedule import decision_schedule, panel_eligibility
 from strategylab.evaluation import stats as st
 from strategylab.models import load_model
 
@@ -45,14 +46,18 @@ def signal_specs(model, specs) -> dict:
     return reps
 
 
-def common_start(model, levels, returns, cfg, specs, sched) -> pd.Timestamp:
+def common_start(model, levels, returns, cfg, specs, sched, elig=None) -> pd.Timestamp:
     """First decision date on which every trial's signal scores >= MIN_SCORED_ASSETS eligible assets."""
-    elig = eligibility(levels, returns, cfg["universe"]["min_history_sessions"])
+    if elig is None:
+        from strategylab.engine.schedule import eligibility
+        elig = eligibility(levels, returns, cfg["universe"]["min_history_sessions"])
     ok = pd.Series(True, index=sched["decision"])
     for spec in signal_specs(model, specs).values():
         sc = model.signal(levels, returns, spec, cfg)
         n = (sc.notna() & elig).sum(axis=1).reindex(sched["decision"])
         ok &= (n >= MIN_SCORED_ASSETS).to_numpy()
+    if not ok.any():
+        raise ValueError("Insufficient eligible history for the pre-registered trial grid")
     return ok[ok].index[0]
 
 
@@ -62,8 +67,13 @@ def benchmarks(cfg) -> tuple[str, str]:
 
 
 def make_cost_model(cfg, panel, multiplier=1.0) -> CostModel:
-    return CostModel(cfg["costs"], {a: v * 1e7 for a, v in panel.etf_adv_cr.items()},
-                     {a["id"]: a["tax_class"] for a in cfg["universe"]["assets"]}, multiplier)
+    classes = {a["id"]: a["tax_class"] for a in cfg["universe"]["assets"]}
+    if panel.mode == "index_proxy":
+        # A hypothetical long-history cost scenario, never inferred from ETFs
+        # that did not exist. This assumption is printed in every proxy report.
+        adv = float(cfg["costs"]["proxy_adv_inr"])
+        return CostModel(cfg["costs"], dict.fromkeys(classes, adv), classes, multiplier)
+    return CostModel(cfg["costs"], {}, classes, multiplier, adv_history=panel.adv_history)
 
 
 def annual_cost_drag(res: Result) -> float:
@@ -80,7 +90,9 @@ def capacity_inr(res: Result, panel, cfg) -> float:
     """
     t = res.trades[res.trades["side"] != "sell_tax"].copy()
     nav_then = res.nav.reindex(pd.to_datetime(t["date"])).to_numpy()
-    t["part_per_inr"] = t["value"] / nav_then / t["asset"].map(lambda a: panel.etf_adv_cr[a] * 1e7)
+    cm = make_cost_model(cfg, panel)
+    adv = np.array([cm.adv(row.asset, row.date) for row in t.itertuples()])
+    t["part_per_inr"] = t["value"] / nav_then / adv
     return float(cfg["costs"]["max_participation"] / t["part_per_inr"].quantile(0.95))
 
 
@@ -124,8 +136,43 @@ def _json_default(o):
 
 # ----- main ----------------------------------------------------------------------------------
 
-def main(strategy_id: str) -> None:
+def output_dir(strategy_id: str, mode: str):
+    return results_dir(strategy_id) if mode == "index_proxy" else results_dir(strategy_id) / mode
+
+
+def main(strategy_id: str, mode: str = "index_proxy") -> None:
     cfg = load_config(strategy_id)
+    cfg.setdefault("data", {})["mode"] = mode
+    out = output_dir(strategy_id, mode)
+    out.mkdir(parents=True, exist_ok=True)
+    status = out / "validation_status.json"
+    legacy = out / "legacy_review"
+    # Only reports from before the corrected pipeline are legacy; every corrected
+    # run writes a status file, so its (possibly blocked) report is not snapshotted.
+    if not legacy.exists() and not status.exists() and (out / "REPORT_dev.md").exists():
+        legacy.mkdir()
+        for name in ("REPORT_dev.md", "dev_summary.json", "data_validation.md"):
+            if (out / name).exists():
+                shutil.copy2(out / name, legacy / name)
+    status.write_text(json.dumps({"state": "running", "mode": mode}))
+    try:
+        _research(strategy_id, cfg, out)
+    except (Exception, SystemExit) as error:
+        # Any failure must replace the previous report, not leave it looking current.
+        detail = str(error) if isinstance(error, (ValueError, SystemExit)) else f"{type(error).__name__}: {error}"
+        status.write_text(json.dumps({"state": "blocked", "mode": mode, "reason": detail}, indent=2))
+        (out / "REPORT_dev.md").write_text(
+            f"# Development evaluation blocked\n\nMode: **{mode}**. Cutoff: {cfg['periods']['dev_end']}.\n\n"
+            f"{detail}\n\nNo corrected performance estimate is available. Prior artifacts are invalidated; "
+            "see legacy_review for the previous report. Holdout was not run. "
+            "The original holdout window previously influenced liquidity and validation; it is not pristine.\n")
+        (out / "dev_summary.json").write_text(json.dumps({"status": "blocked", "mode": mode,
+                                                        "reason": detail}, indent=2))
+        raise SystemExit(detail) from error
+    status.write_text(json.dumps({"state": "valid", "mode": mode}))
+
+
+def _research(strategy_id: str, cfg: dict, OUT) -> None:
     model = load_model(cfg["model"])
     ev = cfg["evaluation"]
     g = cfg.get("gates", {"type": "relative_return"})
@@ -133,14 +180,15 @@ def main(strategy_id: str) -> None:
     sel_kind = ev.get("selection_series", "active_vs_ew")
     sel_label = "active vs EW" if sel_kind == "active_vs_ew" else "excess over cash"
     signal_test = ev.get("signal_test", getattr(model, "SIGNAL_TEST", "cross_sectional"))
-    OUT = results_dir(strategy_id)
     FIG = OUT / "figures"
     FIG.mkdir(parents=True, exist_ok=True)
-    panel = build_panel(cfg)
+    panel = build_panel(cfg, cutoff=cfg["periods"]["dev_end"])
 
     # ---- Gate 1: data -----------------------------------------------------------------
     data_ok, _ = validate(panel, cfg, OUT)
     print(f"[data gate] {'PASS' if data_ok else 'FAIL'}  -> {OUT / 'data_validation.md'}")
+    if not data_ok:
+        raise ValueError("Data gate failed. Repair source gaps/inconsistencies; see data_validation.md.")
 
     dev_end = pd.Timestamp(cfg["periods"]["dev_end"])
     lv = panel.levels.loc[:dev_end]
@@ -152,11 +200,11 @@ def main(strategy_id: str) -> None:
     assert prim in specs, "primary spec must be one of the grid cells"
     fields = list(asdict(prim))
     sched = decision_schedule(lv.index, cfg["decision"]["execution_lag_sessions"], cfg["decision"]["cadence"])
-    start = common_start(model, lv, rt, cfg, specs, sched)
+    elig = panel_eligibility(panel, cfg["universe"]["min_history_sessions"])
+    start = common_start(model, lv, rt, cfg, specs, sched, elig)
     sched = sched[sched["decision"] >= start]
     print(f"[{strategy_id}] {start.date()} .. {dev_end.date()}  ({len(sched)} decisions)")
 
-    elig = eligibility(lv, rt, cfg["universe"]["min_history_sessions"])
     if ev.get("ew_universe", "all") == "risky":
         risky = [a["id"] for a in cfg["universe"]["assets"] if a.get("role", "risky") == "risky"]
         ew_elig = elig & pd.Series(elig.columns.isin(risky), index=elig.columns)
@@ -170,7 +218,8 @@ def main(strategy_id: str) -> None:
     def fwd_returns(h: int) -> pd.DataFrame:
         """Return from the execution close of decision i to the execution close of decision i+h."""
         lvx = lv.loc[ex]
-        f = lvx.shift(-h) / lvx - 1
+        fresh = panel.observed.loc[ex]
+        f = (lvx.shift(-h) / lvx - 1).where(fresh & fresh.shift(-h).fillna(False))
         f.index = sched["decision"].to_numpy()
         return f
 
@@ -208,7 +257,7 @@ def main(strategy_id: str) -> None:
 
     # ---- Backtests --------------------------------------------------------------------
     cm1 = make_cost_model(cfg, panel, 1.0)
-    kw = dict(start=start, end=dev_end)
+    kw = dict(start=start, end=dev_end, observed=panel.observed)
     bh_name, bh_asset = benchmarks(cfg)
     ref_name, ref_series = next(iter(panel.reference.items()), (None, None))
     strat = lambda spec: model_weights(model, spec, lv, rt, elig, cfg)  # noqa: E731
@@ -281,6 +330,8 @@ def main(strategy_id: str) -> None:
             best = (hist.mean() / hist.std()).idxmax()
             picks.append((y, best))
             out.append(sel_m.loc[sel_m.index.year == y, best])
+        if not out:
+            raise ValueError("Insufficient history for the pre-registered 5-year walk-forward evaluation")
         s_ = pd.concat(out)
         wf[kind] = {"series": s_, "picks": picks, "ann": s_.mean() * 12, "SR": ann_sr(s_)}
     prim_same_window = sel_m.loc[wf["expanding"]["series"].index[0]:, prim.name]
@@ -419,7 +470,10 @@ def main(strategy_id: str) -> None:
         "# Development-period report", "",
         f"Strategy: **{strategy_id}** (model `{cfg['model']}`, gates `{gtype}`). Primary spec: **{prim.name}**. "
         f"Period: {start.date()} to {dev_end.date()} ({len(sel_m)} months). "
-        f"Holdout (from {cfg['periods']['holdout_start']}) not touched.", "",
+        f"Holdout (from {cfg['periods']['holdout_start']}) was not run. Prior runs used holdout-period liquidity and validation; it is not a pristine holdout.", "",
+        f"Data mode: **{panel.mode}**. Source cutoff: {panel.cutoff.date()}.", "",
+        (f"Index-proxy experiment: pre-listing index exposures, fractional synthetic units, zero dividend accrual before published yields; fixed assumed ADV Rs {cfg['costs']['proxy_adv_inr']:,.0f}. Not historical ETF trading performance."
+         if panel.mode == "index_proxy" else "ETF-return replication: observed adjusted ETF closes and trailing liquidity only; fractional units and distribution-adjustment limitations remain."), "",
         "## Gates (pre-registered in HYPOTHESIS.md)", "",
         "| Gate | Result | Evidence |", "|---|---|---|",
         *[f"| {n} | {'PASS' if ok else 'FAIL'} | {e} |" for n, ok, e in gates], "",
@@ -471,7 +525,7 @@ def main(strategy_id: str) -> None:
         f"- Cost split at 1x (rupees over the period): explicit {cost_split['explicit']:,.0f}, "
         f"spread {cost_split['spread']:,.0f}, impact {cost_split['impact']:,.0f}.",
         f"- Capacity (95th-percentile trade at <= {cfg['costs']['max_participation']:.0%} of current ETF ADV): "
-        f"about **Rs {cap / 1e7:,.1f} crore**.", "",
+        f"about **Rs {cap / 1e7:,.1f} crore** (scenario estimate, not a historical capacity guarantee).", "",
         "## Latest development-period holdings", "",
         ", ".join(f"{a} {w:.0%}" for a, w in last_w[last_w > 0].items()), "",
     ]
@@ -494,6 +548,8 @@ def main(strategy_id: str) -> None:
                   "reference_price": ref_series.reindex(idx) if ref_series is not None else np.nan,
                   "rf": rf.reindex(idx)}).to_parquet(art / "nav.parquet")
     pd.DataFrame({s.name: nets[s].nav for s in specs}).to_parquet(art / "trial_nav.parquet")
+    pd.DataFrame({"primary_net": nets[prim].cash, "primary_after_tax": taxed[prim].cash,
+                  "ew_net": ew_net.cash, "ew_after_tax": ew_tax.cash}).to_parquet(art / "cash.parquet")
     nets[prim].weights.to_parquet(art / "weights.parquet")
     nets[prim].trades.to_parquet(art / "trades.parquet")
     taxed[prim].trades.to_parquet(art / "trades_after_tax.parquet")
@@ -508,6 +564,8 @@ def main(strategy_id: str) -> None:
     costs.to_parquet(art / "cost_sensitivity.parquet")
     pd.DataFrame({k: v["series"] for k, v in wf.items()}).to_parquet(art / "walk_forward.parquet")
     (art / "stats.json").write_text(json.dumps({
+        "data_mode": panel.mode, "source_cutoff": str(panel.cutoff.date()),
+        "holdout_status": "previously_contaminated_not_run",
         "strategy_id": strategy_id, "model": cfg["model"], "gate_type": gtype,
         "signal_test": signal_test, "signal_label": head_label, "selection_label": sel_label,
         "spec_fields": fields, "benchmark_names": {"market": bh_name, "reference": ref_name},

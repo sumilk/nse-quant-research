@@ -19,6 +19,8 @@ def main() -> None:
                         ("holdout", "spend the holdout (once)")]:
         p = sub.add_parser(name, help=help_)
         p.add_argument("--strategy", required=True, choices=list_strategies())
+        if name == "research":
+            p.add_argument("--mode", choices=["index_proxy", "etf"], default="index_proxy")
         if name == "holdout":
             p.add_argument("--i-have-not-changed-anything", action="store_true", dest="confirm")
     args = ap.parse_args()
@@ -30,7 +32,7 @@ def main() -> None:
         fetch(args.strategy, refresh=args.refresh)
     elif args.cmd == "research":
         from strategylab.evaluation.research import main as research
-        research(args.strategy)
+        research(args.strategy, mode=args.mode)
     elif args.cmd == "current":
         from strategylab.evaluation.current import main as current
         current(args.strategy)

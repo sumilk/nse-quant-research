@@ -69,6 +69,8 @@ portfolio:
   initial_capital_inr: 1000000
 
 costs:
+  # Explicit hypothetical liquidity for index-proxy experiments; never future ETF ADV.
+  proxy_adv_inr: 10000000
   brokerage_inr_per_order: 0.0
   stt_sell_pct: 0.001
   exchange_txn_pct: 0.00297

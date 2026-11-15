@@ -1,6 +1,7 @@
 """Headless smoke test: every dashboard view renders without an exception."""
 
 from pathlib import Path
+import json
 
 import pytest
 from streamlit.testing.v1 import AppTest
@@ -22,6 +23,11 @@ def test_strategy_views_render(strategy_id):
     at = AppTest.from_file(APP, default_timeout=120).run()
     at.sidebar.selectbox[0].set_value(strategy_id).run()
     assert not at.exception, [e.message for e in at.exception]
+    status_path = results_dir(strategy_id) / "validation_status.json"
+    if status_path.exists() and json.loads(status_path.read_text()).get("state") != "valid":
+        assert at.warning
+        assert not at.tabs  # invalidated artifacts must not be presented as results
+        return
     assert len(at.tabs) == 9
     at.sidebar.toggle[0].set_value(True).run()  # after-tax view
     assert not at.exception, [e.message for e in at.exception]

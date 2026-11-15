@@ -16,3 +16,13 @@ that data.
 Strategies tested on the same assets and window: **2**.
 
 Holdout (from 2024-10-01) spent by: none.
+
+## Infrastructure correction — 23 October 2026
+
+The prior development metrics and rejection evidence are preserved in each
+strategy's `results/legacy_review/` but invalidated by the data/accounting
+review. Primary parameters and grids are unchanged. Corrected index-proxy and
+ETF-mode development runs are blocked at their data gates; current reports
+list the source gaps. No new holdout backtest was run. The original window is
+not pristine: earlier costs and validation used observations from that window.
+See [correction details](../docs/RESEARCH_INTEGRITY.md).

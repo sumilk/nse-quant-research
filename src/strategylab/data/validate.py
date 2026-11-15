@@ -37,7 +37,12 @@ def validate(p: Panel, cfg: dict, out: Path) -> tuple[bool, str]:
         aid = a["id"]
         r = p.returns[aid].dropna()
         lv = p.levels[aid].dropna()
-        row = {"asset": aid, "first": lv.index[0].date(), "last": lv.index[-1].date(), "sessions": len(lv),
+        missing = p.gaps.get(aid, [])
+        if missing:
+            failures.append(f"{aid}: unresolved valuation gaps: " + ", ".join(str(d.date()) for d in missing))
+        row = {"asset": aid, "first": lv.index[0].date() if len(lv) else None,
+               "last": lv.index[-1].date() if len(lv) else None, "sessions": len(lv),
+               "unresolved_gaps": len(missing),
                "ffilled": p.ffilled[aid]}
         if aid in p.index_ohlc:
             o = p.index_ohlc[aid]
@@ -68,7 +73,7 @@ def validate(p: Panel, cfg: dict, out: Path) -> tuple[bool, str]:
         row["dy_fill_pct"] = round(fb[1], 2) if fb and fb[0] is not None else None
 
         # Index vs ETF tracking on the overlap (weekly, to avoid close-time asynchrony).
-        if a["source"] != "yahoo" and a.get("etf") and aid != cfg["universe"].get("cash_asset"):
+        if p.mode == "index_proxy" and a["source"] != "yahoo" and a.get("etf") and aid != cfg["universe"].get("cash_asset"):
             e = p.etf[a["etf"]]["adj_close"].reindex(p.calendar).ffill(limit=2)
             both = pd.concat([p.levels[aid], e], axis=1, keys=["idx", "etf"]).dropna()
             wk = both.resample("W-FRI").last().pct_change().dropna()
@@ -90,14 +95,14 @@ def validate(p: Panel, cfg: dict, out: Path) -> tuple[bool, str]:
 
     table = pd.DataFrame(rows)
     ok = not failures
-    lines = ["# Data validation", "", f"Gate: **{'PASS' if ok else 'FAIL'}**", "",
+    lines = ["# Data validation", "", f"Mode: **{p.mode}**. Source cutoff: **{p.cutoff}**.", "", f"Gate: **{'PASS' if ok else 'FAIL'}**", "",
              f"Calendar: {len(p.calendar)} NSE sessions, {p.calendar[0].date()} to {p.calendar[-1].date()}"
              f" ({cfg['universe']['calendar_master']} trading days).", "",
              table.to_markdown(index=False), "",
              "## Extreme daily moves (> 20%)", ""]
     lines += [f"- {a} {d}: {v} — {why or '**UNEXPLAINED**'}" for a, d, v, why in extremes] or ["- none"]
     spikes = {t: ds for t, ds in p.etf_spikes.items() if ds}
-    lines += ["", "## One-off prints removed (more than 3x from the 11-session median)", ""]
+    lines += ["", "## Reviewed bad prints excluded (fixed dates; no future-median filter)", ""]
     lines += [f"- {t}: {', '.join(str(d.date()) for d in ds)}" for t, ds in spikes.items()] or ["- none"]
     rebased = {t: ev for t, ev in p.rebases.items() if ev}
     lines += ["", "## Persistent level jumps undone (splits, face-value changes; earlier history rescaled)", ""]
@@ -106,11 +111,13 @@ def validate(p: Panel, cfg: dict, out: Path) -> tuple[bool, str]:
     lines += ["", "## Waived (documented in config data_notes.waivers)", ""] + ([f"- {w}" for w in waived] or ["- none"])
     lines += ["", "## Notes", "",
               "- `dy_from`: first session with a published NSE dividend yield. Earlier sessions use "
-              "`dy_fill_pct`, the median yield over the first published year (approximation).",
+              "zero accrual; no yield from future observations is backfilled (price-only approximation).",
               "- `ffilled`: sessions missing after the first price and carried forward (max 2 per gap).",
               "- `off_calendar`: source rows on dates that are not NIFTY 50 sessions (dropped).",
-              "- ETF ADV is the median daily traded value over the last year: it sets spread tiers, "
-              "impact and capacity, and is applied to all history (a known approximation).",
+              "- ETF ADV shown here is the trailing 63-session median at the source cutoff; "
+              "ETF-mode trade costs use the lagged estimate for each individual trade date.",
+              "- Index-proxy mode uses a declared fixed liquidity assumption, not future ETF liquidity.",
+              "- Missing/stale quotes are never execution prices. Unresolved valuation gaps are fatal.",
               ]
     out.mkdir(parents=True, exist_ok=True)
     (out / "data_validation.md").write_text("\n".join(lines) + "\n")

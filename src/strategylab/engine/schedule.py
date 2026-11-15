@@ -30,3 +30,12 @@ def eligibility(levels: pd.DataFrame, returns: pd.DataFrame, min_history: int) -
     """True where the asset has a price today and >= min_history past returns."""
     history = returns.notna().cumsum()
     return levels.notna() & (history >= min_history)
+
+
+def panel_eligibility(panel, min_history: int) -> pd.DataFrame:
+    """Common strategy/benchmark eligibility; never trade a carried quote."""
+    out = eligibility(panel.levels, panel.returns, min_history)
+    out &= panel.observed.reindex_like(out).fillna(False)
+    if panel.mode == "etf":
+        out &= panel.adv_history.reindex_like(out).gt(0)
+    return out

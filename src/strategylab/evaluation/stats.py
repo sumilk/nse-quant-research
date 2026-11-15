@@ -20,7 +20,8 @@ EULER = np.euler_gamma
 # ----- performance -------------------------------------------------------------
 
 def perf(nav: pd.Series, rf: pd.Series, after_tax_terminal: float | None = None) -> dict:
-    r = nav.pct_change().dropna()
+    validate_nav(nav)
+    r = nav.pct_change(fill_method=None).iloc[1:]
     ex = r - rf.reindex(r.index).fillna(0)
     years = (nav.index[-1] - nav.index[0]).days / 365.25
     dd = nav / nav.cummax() - 1
@@ -28,7 +29,7 @@ def perf(nav: pd.Series, rf: pd.Series, after_tax_terminal: float | None = None)
     peak = nav.loc[:trough].idxmax()
     rec = nav.loc[trough:][nav.loc[trough:] >= nav.loc[peak]]
     dd_days = ((rec.index[0] if len(rec) else nav.index[-1]) - peak).days
-    downside = ex[ex < 0].std() * np.sqrt(252)
+    downside = np.sqrt(np.mean(np.minimum(ex, 0.0) ** 2) * 252)
     cagr = (nav.iloc[-1] / nav.iloc[0]) ** (1 / years) - 1
     var95 = np.percentile(r, 5)
     m = nav.resample("ME").last().pct_change().dropna()
@@ -50,8 +51,16 @@ def perf(nav: pd.Series, rf: pd.Series, after_tax_terminal: float | None = None)
     return out
 
 
+def validate_nav(nav: pd.Series) -> None:
+    if len(nav) < 2 or not np.isfinite(nav.to_numpy()).all() or (nav <= 0).any():
+        raise ValueError("NAV must contain at least two finite positive observations, without gaps")
+    if not nav.index.is_monotonic_increasing or nav.index.has_duplicates:
+        raise ValueError("NAV dates must be ordered and unique")
+
+
 def monthly(nav: pd.Series) -> pd.Series:
-    return nav.resample("ME").last().pct_change().dropna()
+    validate_nav(nav)
+    return nav.resample("ME").last().pct_change(fill_method=None).iloc[1:]
 
 
 # ----- signal ---------------------------------------------------------------------

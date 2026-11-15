@@ -1,0 +1,5 @@
+{
+  "state": "blocked",
+  "mode": "index_proxy",
+  "reason": "Data gate failed. Repair source gaps/inconsistencies; see data_validation.md."
+}

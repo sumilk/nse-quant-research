@@ -13,18 +13,18 @@ import pandas as pd
 from strategylab.config import load_config, results_dir
 from strategylab.models import load_model
 from strategylab.data.panel import build_panel
-from strategylab.engine.schedule import eligibility
+from strategylab.engine.schedule import panel_eligibility
 
 
 def main(strategy_id: str) -> None:
     cfg = load_config(strategy_id)
     model = load_model(cfg["model"])
-    panel = build_panel(cfg)
+    panel = build_panel(cfg, cutoff=pd.Timestamp.now().normalize(), mode="etf")
     spec = model.primary(cfg)
     lv, rt = panel.levels, panel.returns
     asof = lv.index[-1]
     sc = model.signal(lv, rt, spec, cfg).loc[asof]
-    el = eligibility(lv, rt, cfg["universe"]["min_history_sessions"]).loc[asof]
+    el = panel_eligibility(panel, cfg["universe"]["min_history_sessions"]).loc[asof]
     w = model.weights(sc, el, spec, cfg)
     etf = {a["id"]: a.get("etf") for a in cfg["universe"]["assets"]}
     vol = rt.rolling(63).std().loc[asof] * (252 ** 0.5)

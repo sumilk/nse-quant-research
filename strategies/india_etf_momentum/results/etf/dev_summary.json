@@ -1,0 +1,5 @@
+{
+  "status": "blocked",
+  "mode": "etf",
+  "reason": "Data gate failed. Repair source gaps/inconsistencies; see data_validation.md."
+}

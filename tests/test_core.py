@@ -115,6 +115,8 @@ def test_cash_never_negative_with_costs_and_tax():
     wf = model_weights(xm, xm.Spec("ret", 126, 0, 2), lv, r, elig, cfg)
     res = run("rk", lv, r, cfg, cm, weights_fn=wf, start=lv.index[260], end=lv.index[-1])
     assert (res.nav > 0).all()
+    assert (res.cash >= 0).all()
+    np.testing.assert_allclose(res.cash + res.invested, res.nav)
     assert res.costs.sum() > 0
 
 

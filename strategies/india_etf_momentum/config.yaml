@@ -78,6 +78,8 @@ portfolio:
 # Indian retail delivery charges (discount broker). Verify against your broker's
 # current schedule before deploying; these are the 2026 rates as understood.
 costs:
+  # Explicit hypothetical liquidity for index-proxy experiments; never future ETF ADV.
+  proxy_adv_inr: 10000000
   brokerage_inr_per_order: 0.0
   stt_sell_pct: 0.001                # % of sell value, equity-oriented ETFs only
   exchange_txn_pct: 0.00297          # NSE transaction charge, both sides

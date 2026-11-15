@@ -22,7 +22,7 @@ from strategylab.config import load_config, results_dir
 from strategylab.models import load_model
 from strategylab.data.panel import build_panel
 from strategylab.evaluation.research import benchmarks, make_cost_model
-from strategylab.engine.schedule import eligibility
+from strategylab.engine.schedule import panel_eligibility
 
 
 def main(strategy_id: str, confirm: bool) -> None:
@@ -32,6 +32,10 @@ def main(strategy_id: str, confirm: bool) -> None:
         sys.exit(f"Holdout already used on {marker.read_text().strip()}. Re-running it would spend it twice.")
     if not confirm:
         sys.exit("Pass --i-have-not-changed-anything to spend the holdout (this can be done once).")
+    status = results_dir(strategy_id) / "validation_status.json"
+    if not status.exists() or json.loads(status.read_text()).get("state") != "valid":
+        sys.exit("A valid corrected development evaluation is required before holdout.")
+    print("Disclosure: this window previously influenced liquidity/validation; it is not pristine.")
     dev_stats = results_dir(strategy_id) / "artifacts" / "dev" / "stats.json"
     if not dev_stats.exists():
         sys.exit("Run the development research first: every gate must be reviewed before the holdout.")
@@ -39,13 +43,13 @@ def main(strategy_id: str, confirm: bool) -> None:
 
     cfg = load_config(strategy_id)
     model = load_model(cfg["model"])
-    panel = build_panel(cfg)
+    panel = build_panel(cfg, cutoff=pd.Timestamp.now().normalize())
     lv, rt, rf = panel.levels, panel.returns, panel.rf
     start = pd.Timestamp(cfg["periods"]["holdout_start"])
     # Start one session earlier so the decision taken on the last pre-holdout session is the first trade.
     first = lv.index[lv.index < start][-1]
     end = lv.index[-1]
-    elig = eligibility(lv, rt, cfg["universe"]["min_history_sessions"])
+    elig = panel_eligibility(panel, cfg["universe"]["min_history_sessions"])
     ew_elig = elig
     if cfg["evaluation"].get("ew_universe", "all") == "risky":
         risky = [a["id"] for a in cfg["universe"]["assets"] if a.get("role", "risky") == "risky"]
@@ -56,7 +60,7 @@ def main(strategy_id: str, confirm: bool) -> None:
     wf_name = dev["walk_forward"]["expanding"]["picks"][-1][1]
     wf_spec = next(s for s in model.grid(cfg) if s.name == wf_name)
     bh_name, bh_asset = benchmarks(cfg)
-    kw = dict(start=first, end=end)
+    kw = dict(start=first, end=end, observed=panel.observed)
 
     res = {
         "primary_net": run(prim.name, lv, rt, cfg, cm, weights_fn=model_weights(model, prim, lv, rt, elig, cfg), tax=False, **kw),
@@ -91,6 +95,7 @@ def main(strategy_id: str, confirm: bool) -> None:
     res["primary_net"].weights.to_parquet(art / "weights.parquet")
     res["primary_net"].trades.to_parquet(art / "trades.parquet")
     (art / "stats.json").write_text(json.dumps({
+        "holdout_status": "previously_contaminated",
         "primary": prim.name, "walk_forward_spec": wf_spec.name,
         "start": str(idx[0].date()), "end": str(end.date()), "perf": perf,
         "active_monthly_mean_ann": float(active.mean() * 12),
